@@ -51,6 +51,10 @@ class GdmaDma : public PlatformDma {
    */
   void stop_transfer() override;
 
+  void set_frame_callback(Hub75FrameCallback callback, void *arg) override;
+
+  static bool IRAM_ATTR on_trans_eof(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data);
+
   /**
    * @brief Set basis brightness (override base class)
    */

@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef bool (*Hub75FrameCallback)(void *arg);
+
 #ifdef __cplusplus
 extern "C" {
 #endif

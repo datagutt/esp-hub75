@@ -39,6 +39,12 @@ class ParlioDma : public PlatformDma {
   void shutdown() override;
   void start_transfer() override;
   void stop_transfer() override;
+  void set_frame_callback(Hub75FrameCallback callback, void *arg) override;
+
+  static bool IRAM_ATTR on_buffer_switched(parlio_tx_unit_handle_t tx_unit,
+                                           const parlio_tx_buffer_switched_event_data_t *event_data,
+                                           void *user_data);
+
   void set_basis_brightness(uint8_t brightness) override;
   void set_intensity(float intensity) override;
   void set_rotation(Hub75Rotation rotation) override;

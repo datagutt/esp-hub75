@@ -159,6 +159,12 @@ bool ParlioDma::init() {
 
   ESP_LOGI(TAG, "PARLIO TX initialized successfully with circular DMA");
 
+  // Register frame callback if already set
+  if (frame_callback_) {
+    parlio_tx_event_callbacks_t cbs = {.on_trans_done = NULL, .on_buffer_switched = ParlioDma::on_buffer_switched};
+    parlio_tx_unit_register_event_callbacks(tx_unit_, &cbs, this);
+  }
+
   return true;
 }
 
@@ -488,6 +494,30 @@ void ParlioDma::stop_transfer() {
   ESP_LOGI(TAG, "Stopping PARLIO transfer");
   parlio_tx_unit_disable(tx_unit_);
   transfer_started_ = false;
+}
+
+void ParlioDma::set_frame_callback(Hub75FrameCallback callback, void *arg) {
+  PlatformDma::set_frame_callback(callback, arg);
+
+  if (tx_unit_) {
+    if (callback) {
+      parlio_tx_event_callbacks_t cbs = {.on_trans_done = NULL, .on_buffer_switched = ParlioDma::on_buffer_switched};
+      parlio_tx_unit_register_event_callbacks(tx_unit_, &cbs, this);
+    } else {
+      parlio_tx_event_callbacks_t cbs = {.on_trans_done = NULL, .on_buffer_switched = NULL};
+      parlio_tx_unit_register_event_callbacks(tx_unit_, &cbs, NULL);
+    }
+  }
+}
+
+bool IRAM_ATTR ParlioDma::on_buffer_switched(parlio_tx_unit_handle_t tx_unit,
+                                             const parlio_tx_buffer_switched_event_data_t *event_data,
+                                             void *user_data) {
+  auto *dma = static_cast<ParlioDma *>(user_data);
+  if (dma && dma->frame_callback_) {
+    return dma->frame_callback_(dma->frame_callback_arg_);
+  }
+  return false;
 }
 
 void ParlioDma::initialize_buffer_internal(BitPlaneBuffer *buffers) {

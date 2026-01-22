@@ -57,6 +57,16 @@ class Hub75Driver {
    */
   void end();
 
+  /**
+   * @brief Register a callback to be called on each frame completion
+   *
+   * This callback is executed from an ISR.
+   *
+   * @param callback Function to call
+   * @param arg Argument to pass to the callback
+   */
+  void set_frame_callback(Hub75FrameCallback callback, void *arg);
+
   // ========================================================================
   // Pixel Drawing API
   // ========================================================================
