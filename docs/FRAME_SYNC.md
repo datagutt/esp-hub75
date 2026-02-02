@@ -15,8 +15,8 @@ The LED matrix refreshes at a high rate (typically >100Hz) asynchronously from y
 | Platform | Mechanism | Status |
 |----------|-----------|--------|
 | **ESP32-S3** | GDMA EOF (End of Frame) Interrupt | ✅ Supported |
-| **ESP32-P4** | PARLIO Buffer Switch / Transmit Done | ✅ Supported |
-| **ESP32-C6** | PARLIO Buffer Switch / Transmit Done | ✅ Supported |
+| **ESP32-P4** | PARLIO TX done (chunked queue, frame boundary) | ✅ Supported |
+| **ESP32-C6** | PARLIO TX done (chunked queue, frame boundary) | ✅ Supported |
 | **ESP32/S2** | I2S EOF Interrupt | ❌ Not yet implemented |
 
 ## Usage
@@ -147,6 +147,6 @@ void set_frame_callback(Hub75FrameCallback callback, void *arg);
 ## Implementation Details
 
 *   **ESP32-S3 (GDMA)**: Hooks into the `on_trans_eof` event of the GDMA engine. Triggers when the last descriptor in the chain (frame end) is processed.
-*   **ESP32-P4/C6 (PARLIO)**: Hooks into the `on_buffer_switched` (P4) or transaction completion events.
+*   **ESP32-P4/C6 (PARLIO)**: Hooks into the PARLIO `on_trans_done` ISR. The driver queues a frame as multiple TX chunks and counts completed chunks; the callback fires when the final chunk of a frame completes.
 
 The driver handles the low-level ISR registration logic internally, ensuring the callback is attached to the correct hardware channel/unit.

@@ -123,3 +123,4 @@ foreach(opt IN LISTS DEPRECATED_GAMMA_OPTIONS)
             "Run 'idf.py save-defconfig' to generate updated config.")
     endif()
 endforeach()
+

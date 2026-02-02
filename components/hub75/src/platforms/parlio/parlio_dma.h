@@ -17,6 +17,7 @@
 #include <driver/parlio_tx.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <vector>
 
 namespace hub75 {
 
@@ -82,6 +83,17 @@ class ParlioDma : public PlatformDma {
   bool build_transaction_queue();
   void calculate_bcm_timings();
   size_t calculate_bcm_padding(uint8_t bit_plane);
+  struct ChunkDescriptor {
+    uint16_t *ptr;
+    size_t bits;
+    size_t words;
+    size_t next_segment_index;
+    size_t next_segment_offset_words;
+    int next_tx_idx;
+    bool swap_pending_cleared;
+  };
+  bool generate_next_chunk_descriptor(ChunkDescriptor &desc);
+  void fill_chunk_ring();
   bool IRAM_ATTR queue_next_chunk(bool invoke_frame_callback);
   static void tx_task_trampoline(void *arg);
   void tx_task_loop();
@@ -132,11 +144,20 @@ class ParlioDma : public PlatformDma {
   size_t segment_count_;       // Number of bit-plane segments per buffer
   size_t segment_index_;       // Current segment index
   size_t segment_offset_words_;  // Offset within current segment
+  size_t gen_segment_index_;   // Look-ahead generator segment index for ring
+  size_t gen_segment_offset_words_;  // Look-ahead generator offset for ring
   size_t tx_queue_depth_;      // Cached queue depth for chunk priming
   int tx_idx_;                 // Buffer index currently transmitted by PARLIO
   int pending_tx_idx_;         // Buffer index to switch to at frame boundary
   bool tx_swap_pending_;       // True when a buffer switch is pending
+  int gen_tx_idx_;             // Look-ahead buffer index for ring generation
+  bool gen_swap_pending_;      // Look-ahead swap pending flag for ring generation
   size_t completed_chunk_index_;  // Completed chunks in current frame (ISR)
+  size_t chunk_ring_capacity_;    // Size of chunk descriptor ring buffer
+  size_t chunk_ring_head_;        // Ring head index
+  size_t chunk_ring_tail_;        // Ring tail index
+  size_t chunk_ring_count_;       // Number of valid descriptors in ring
+  std::vector<ChunkDescriptor> chunk_ring_;
   TaskHandle_t tx_task_;       // Task that feeds PARLIO chunks
   bool tx_task_started_;
   uint8_t basis_brightness_;
