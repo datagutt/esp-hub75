@@ -216,7 +216,8 @@ bool GdmaDma::init() {
 
   // Register frame callback if already set
   if (frame_callback_) {
-    gdma_tx_event_callbacks_t cbs = {.on_trans_eof = GdmaDma::on_trans_eof};
+    gdma_tx_event_callbacks_t cbs = {};
+      cbs.on_trans_eof = GdmaDma::on_trans_eof;
     gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
   }
   // The descriptor chain encodes all timing via repetition counts
@@ -497,10 +498,11 @@ void GdmaDma::set_frame_callback(Hub75FrameCallback callback, void *arg) {
 
   if (dma_chan_) {
     if (callback) {
-      gdma_tx_event_callbacks_t cbs = {.on_trans_eof = GdmaDma::on_trans_eof};
+      gdma_tx_event_callbacks_t cbs = {};
+      cbs.on_trans_eof = GdmaDma::on_trans_eof;
       gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
     } else {
-      gdma_tx_event_callbacks_t cbs = {.on_trans_eof = NULL};
+      gdma_tx_event_callbacks_t cbs = {};
       gdma_register_tx_event_callbacks(dma_chan_, &cbs, NULL);
     }
   }
