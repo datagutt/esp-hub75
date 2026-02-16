@@ -496,16 +496,14 @@ void GdmaDma::stop_transfer() {
 void GdmaDma::set_frame_callback(Hub75FrameCallback callback, void *arg) {
   PlatformDma::set_frame_callback(callback, arg);
 
-  if (dma_chan_) {
-    if (callback) {
-      gdma_tx_event_callbacks_t cbs = {};
-      cbs.on_trans_eof = GdmaDma::on_trans_eof;
-      gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
-    } else {
-      gdma_tx_event_callbacks_t cbs = {};
-      gdma_register_tx_event_callbacks(dma_chan_, &cbs, NULL);
-    }
+  if (dma_chan_ && callback) {
+    gdma_tx_event_callbacks_t cbs = {};
+    cbs.on_trans_eof = GdmaDma::on_trans_eof;
+    gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
   }
+  // When callback is null: internal pointer is cleared by base class.
+  // ISR checks frame_callback_ for null, so it's safe.
+  // Full cleanup happens in shutdown() -> gdma_del_channel().
 }
 
 bool IRAM_ATTR GdmaDma::on_trans_eof(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data) {
@@ -525,6 +523,8 @@ void GdmaDma::shutdown() {
     gdma_disconnect(dma_chan_);
     gdma_del_channel(dma_chan_);
     dma_chan_ = nullptr;
+
+    periph_module_disable(PERIPH_LCD_CAM_MODULE);
   }
 
   // Free all allocated resources (using array structure)
@@ -549,8 +549,6 @@ void GdmaDma::shutdown() {
   }
 
   descriptor_count_ = 0;
-
-  periph_module_disable(PERIPH_LCD_CAM_MODULE);
 
   ESP_LOGI(TAG, "Shutdown complete");
 }
