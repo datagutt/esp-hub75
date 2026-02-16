@@ -51,6 +51,10 @@ class GdmaDma : public PlatformDma {
    */
   void stop_transfer() override;
 
+  void set_frame_callback(Hub75FrameCallback callback, void *arg) override;
+
+  static bool IRAM_ATTR on_trans_eof(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data);
+
   /**
    * @brief Set basis brightness (override base class)
    */
@@ -95,6 +99,12 @@ class GdmaDma : public PlatformDma {
    * @brief Swap front and back buffers (double buffer mode only)
    */
   void flip_buffer() override;
+
+  /**
+   * @brief Get GDMA channel handle for external callback registration
+   * @return GDMA channel handle, or NULL if not initialized
+   */
+  gdma_channel_handle_t getGdmaChannel() const { return dma_chan_; }
 
   // ============================================================================
   // Static Helper Functions (Public for compile-time validation)
@@ -171,6 +181,12 @@ class GdmaDma : public PlatformDma {
   // Brightness control (implementation of base class interface)
   uint8_t basis_brightness_;  // 1-255
   float intensity_;           // 0.0-1.0
+
+  // Pixel pattern cache for consecutive identical pixels optimization
+  // Persists across draw_pixels() calls to benefit single-pixel APIs
+  uint32_t cached_raw_pixel_ = 0;  // Raw source bytes packed into uint32_t
+  uint16_t cached_upper_patterns_[HUB75_BIT_DEPTH] = {0};
+  uint16_t cached_lower_patterns_[HUB75_BIT_DEPTH] = {0};
 };
 
 }  // namespace hub75
