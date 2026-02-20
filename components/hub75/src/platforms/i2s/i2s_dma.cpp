@@ -1070,33 +1070,43 @@ HUB75_IRAM void I2sDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t
   // Process each pixel
   const uint8_t *pixel_ptr = buffer;
   for (uint16_t dy = 0; dy < h; dy++) {
+    const uint16_t py = y + dy;
+
+    // Hoist row/is_lower computation for identity transform (constant per row)
+    uint16_t id_row = 0;
+    uint8_t *id_base_ptr = nullptr;
+    uint16_t id_clear_mask = 0;
+    if (identity_transform) {
+      if (py < num_rows_) {
+        id_row = py;
+        id_clear_mask = ~RGB_UPPER_MASK;
+      } else {
+        id_row = py - num_rows_;
+        id_clear_mask = ~RGB_LOWER_MASK;
+      }
+      id_base_ptr = target_buffers[id_row].data;
+    }
+
     for (uint16_t dx = 0; dx < w; dx++) {
       uint16_t px = x + dx;
-      uint16_t py = y + dy;
-      uint16_t row;
-      bool is_lower;
+      uint8_t *base_ptr;
+      uint16_t clear_mask;
 
       HUB75_PROFILE_BEGIN();
 
-      // Fast path: identity transform (no rotation, standard layout, standard scan)
+      // Fast path: identity transform — row-level values already computed
       if (identity_transform) {
-        // Simple row/half calculation without modulo (subtraction is cheaper)
-        if (py < num_rows_) {
-          row = py;
-          is_lower = false;
-        } else {
-          row = py - num_rows_;
-          is_lower = true;
-        }
         px = fifo_adjust_x(px);
+        base_ptr = id_base_ptr;
+        clear_mask = id_clear_mask;
       } else {
         // Full coordinate transformation pipeline
         auto transformed = transform_coordinate(px, py, rotation_, needs_layout_remap_, needs_scan_remap_, layout_,
                                                 scan_wiring_, panel_width_, panel_height_, layout_rows_, layout_cols_,
                                                 virtual_width_, virtual_height_, dma_width_, num_rows_);
         px = fifo_adjust_x(transformed.x);
-        row = transformed.row;
-        is_lower = transformed.is_lower;
+        base_ptr = target_buffers[transformed.row].data;
+        clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
       }
 
       HUB75_PROFILE_STAGE(PROFILE_TRANSFORM);
@@ -1138,17 +1148,13 @@ HUB75_IRAM void I2sDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t
       }
       pixel_ptr += pixel_stride;
 
-      // Apply cached patterns to all bit planes
-      uint8_t *base_ptr = target_buffers[row].data;
+      // Select upper or lower cached patterns based on half
+      const uint16_t *patterns = (clear_mask == (uint16_t)~RGB_LOWER_MASK) ? cached_lower_patterns_ : cached_upper_patterns_;
+
+      // Apply cached patterns to all bit planes (branch-free inner loop)
       for (int bit = 0; bit < bit_depth_; bit++) {
         uint16_t *buf = (uint16_t *) (base_ptr + (bit * bit_plane_stride));
-        uint16_t word = buf[px];
-        if (is_lower) {
-          word = (word & ~RGB_LOWER_MASK) | cached_lower_patterns_[bit];
-        } else {
-          word = (word & ~RGB_UPPER_MASK) | cached_upper_patterns_[bit];
-        }
-        buf[px] = word;
+        buf[px] = (buf[px] & clear_mask) | patterns[bit];
       }
 
       HUB75_PROFILE_STAGE(PROFILE_BITPLANE);
@@ -1226,36 +1232,49 @@ HUB75_IRAM void I2sDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uin
 
   // Fill loop
   for (uint16_t dy = 0; dy < h; dy++) {
+    const uint16_t py = y + dy;
+
+    // Hoist row-level values for identity transform (constant per row)
+    uint8_t *id_base_ptr = nullptr;
+    uint16_t id_clear_mask = 0;
+    const uint16_t *id_patterns = nullptr;
+    if (identity_transform) {
+      bool id_is_lower;
+      if (py < num_rows_) {
+        id_is_lower = false;
+        id_base_ptr = target_buffers[py].data;
+      } else {
+        id_is_lower = true;
+        id_base_ptr = target_buffers[py - num_rows_].data;
+      }
+      id_clear_mask = id_is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
+      id_patterns = id_is_lower ? lower_patterns : upper_patterns;
+    }
+
     for (uint16_t dx = 0; dx < w; dx++) {
       uint16_t px = x + dx;
-      uint16_t py = y + dy;
-      uint16_t row;
-      bool is_lower;
+      uint8_t *base_ptr;
+      uint16_t clear_mask;
+      const uint16_t *patterns;
 
-      // Fast path: identity transform (no rotation, standard layout, standard scan)
+      // Fast path: identity transform — row-level values already computed
       if (identity_transform) {
-        if (py < num_rows_) {
-          row = py;
-          is_lower = false;
-        } else {
-          row = py - num_rows_;
-          is_lower = true;
-        }
         px = fifo_adjust_x(px);
+        base_ptr = id_base_ptr;
+        clear_mask = id_clear_mask;
+        patterns = id_patterns;
       } else {
         // Full coordinate transformation pipeline
         auto transformed = transform_coordinate(px, py, rotation_, needs_layout_remap_, needs_scan_remap_, layout_,
                                                 scan_wiring_, panel_width_, panel_height_, layout_rows_, layout_cols_,
                                                 virtual_width_, virtual_height_, dma_width_, num_rows_);
         px = fifo_adjust_x(transformed.x);
-        row = transformed.row;
-        is_lower = transformed.is_lower;
+        base_ptr = target_buffers[transformed.row].data;
+        clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
+        patterns = transformed.is_lower ? lower_patterns : upper_patterns;
       }
 
-      // Update all bit planes using pre-computed patterns (is_lower hoisted outside loop)
-      uint8_t *base_ptr = target_buffers[row].data;
-      const uint16_t clear_mask = is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
-      const uint16_t *patterns = is_lower ? lower_patterns : upper_patterns;
+      // Update all bit planes (branch-free inner loop)
       for (int bit = 0; bit < bit_depth_; bit++) {
         uint16_t *buf = (uint16_t *) (base_ptr + (bit * bit_plane_stride));
         buf[px] = (buf[px] & clear_mask) | patterns[bit];
