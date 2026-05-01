@@ -1,0 +1,23 @@
+components/hub75/src/platforms/gdma/gdma_dma.cpp
+  1142cf68be5f94bf 144-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "15ed66e42c620ded8bd61eaaf73455d569dc8938",
+  "prompts": {
+    "1142cf68be5f94bf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdfd4405-8d09-4a53-b5a1-ed311ce4e9b1",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Thomas Lekanger",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 1,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    }
+  }
+}
