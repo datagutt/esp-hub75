@@ -1,7 +1,7 @@
 # ESP32 HUB75 DMA Driver
 # CMakeLists.txt for ESP-IDF component
 
-# Build REQUIRES list conditionally (esp_mm only exists in ESP-IDF 5.x for P4/C6)
+# Build REQUIRES list conditionally (esp_mm exists from ESP-IDF 5.x onward)
 # Use IDF_TARGET (CMake variable) not CONFIG_IDF_TARGET_* (Kconfig, not yet available)
 set(HUB75_COMPONENT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 set(HUB75_REQUIRES
@@ -10,7 +10,7 @@ set(HUB75_REQUIRES
     esp_hw_support
     freertos
 )
-if(IDF_TARGET STREQUAL "esp32p4" OR IDF_TARGET STREQUAL "esp32c6")
+if(IDF_VERSION_MAJOR GREATER_EQUAL 5)
     list(APPEND HUB75_REQUIRES esp_mm)
 endif()
 
