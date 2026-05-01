@@ -318,17 +318,18 @@ HUB75_CONST uint32_t I2sDma::resolve_actual_clock_speed(Hub75ClockSpeed clock_sp
 
 #else
   // ESP32: PLL_D2_CLK clock source (80 MHz base)
-  // Max output: 80 / 2 / 4 = 10 MHz (with minimum dividers)
-  // Available: 10 MHz (div=2), 6.67 MHz (div=3), 5 MHz (div=4), 4 MHz (div=5), ...
+  // Max output: 80 / 1 / 4 = 20 MHz (with minimum dividers)
+  // Available: 20 MHz (div=1), 10 MHz (div=2), 6.67 MHz (div=3), 5 MHz (div=4), ...
   //
-  // The ESP32's lower base clock (80 MHz vs 160 MHz) combined with the same
-  // divider constraints results in half the max frequency of ESP32-S2.
-  if (requested_hz > 10000000) {
-    ESP_LOGW(TAG, "Requested %u Hz exceeds ESP32 max (10 MHz), using 10 MHz", (unsigned int) requested_hz);
-    return 10000000;
+  // Note: clkm_div=1 violates the TRM-recommended minimum of 2 but works in
+  // practice on tested hardware. If signal integrity issues appear at 20 MHz,
+  // raise the floor back to 2.
+  if (requested_hz > 20000000) {
+    ESP_LOGW(TAG, "Requested %u Hz exceeds ESP32 max (20 MHz), using 20 MHz", (unsigned int) requested_hz);
+    return 20000000;
   }
   uint32_t divider = (80000000 + requested_hz * 2) / (requested_hz * 4);  // Round to nearest
-  return 80000000 / (std::max(divider, uint32_t{2}) * 4);
+  return 80000000 / (std::max(divider, uint32_t{1}) * 4);
 #endif
 }
 
