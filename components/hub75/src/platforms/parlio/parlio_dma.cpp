@@ -568,19 +568,18 @@ bool ParlioDma::allocate_row_buffers() {
   total_buffer_bytes_ = total_bytes;  // Cache for flush_cache_to_dma() and build_transaction_queue()
 
   // Always allocate first buffer (buffer 0)
-  // ESP32-C6 has no PSRAM, so use internal DMA-capable memory
-#ifdef CONFIG_IDF_TARGET_ESP32C6
-  static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
-  ESP_LOGI(TAG, "Allocating buffer [0]: %zu bytes for %d rows × %d bits (internal RAM)", total_bytes, num_rows_,
-           bit_depth_);
-  dma_buffers_[0] = (uint16_t *) heap_caps_calloc(total_words, sizeof(uint16_t), DMA_MEM_CAPS);
-#else
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
   static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM;
   // Use 32-byte (8-word) alignment for PSRAM to enable hardware burst transfers
   static constexpr size_t PSRAM_ALIGNMENT = 32;
   ESP_LOGI(TAG, "Allocating buffer [0]: %zu bytes for %d rows × %d bits (PSRAM, 32-byte aligned)", total_bytes,
            num_rows_, bit_depth_);
   dma_buffers_[0] = (uint16_t *) heap_caps_aligned_calloc(PSRAM_ALIGNMENT, total_words, sizeof(uint16_t), DMA_MEM_CAPS);
+#else
+  static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
+  ESP_LOGI(TAG, "Allocating buffer [0]: %zu bytes for %d rows × %d bits (internal RAM)", total_bytes, num_rows_,
+           bit_depth_);
+  dma_buffers_[0] = (uint16_t *) heap_caps_calloc(total_words, sizeof(uint16_t), DMA_MEM_CAPS);
 #endif
 
   if (!dma_buffers_[0]) {
@@ -609,12 +608,12 @@ bool ParlioDma::allocate_row_buffers() {
   if (config_.double_buffer) {
     ESP_LOGI(TAG, "Allocating buffer [1]: %zu bytes (double buffering enabled)", total_bytes);
     row_buffers_[1] = new BitPlaneBuffer[buffer_count];
-#ifdef CONFIG_IDF_TARGET_ESP32C6
-    dma_buffers_[1] = (uint16_t *) heap_caps_calloc(total_words, sizeof(uint16_t), DMA_MEM_CAPS);
-#else
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
     // Use 32-byte (8-word) alignment for PSRAM to enable hardware burst transfers
     dma_buffers_[1] =
         (uint16_t *) heap_caps_aligned_calloc(PSRAM_ALIGNMENT, total_words, sizeof(uint16_t), DMA_MEM_CAPS);
+#else
+    dma_buffers_[1] = (uint16_t *) heap_caps_calloc(total_words, sizeof(uint16_t), DMA_MEM_CAPS);
 #endif
 
     if (!dma_buffers_[1]) {
@@ -639,11 +638,11 @@ bool ParlioDma::allocate_row_buffers() {
       }
       // Set indices for double-buffer mode (front=0, active=1)
       active_idx_ = 1;
-#ifdef CONFIG_IDF_TARGET_ESP32C6
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
+      ESP_LOGI(TAG, "Double buffering: 2 × %zu KB = %zu KB total PSRAM", total_bytes / 1024, (total_bytes * 2) / 1024);
+#else
       ESP_LOGI(TAG, "Double buffering: 2 × %zu KB = %zu KB total internal RAM", total_bytes / 1024,
                (total_bytes * 2) / 1024);
-#else
-      ESP_LOGI(TAG, "Double buffering: 2 × %zu KB = %zu KB total PSRAM", total_bytes / 1024, (total_bytes * 2) / 1024);
 #endif
     }
   }
@@ -960,9 +959,8 @@ void ParlioDma::set_brightness_oe() {
 }
 
 void ParlioDma::flush_cache_to_dma() {
-  // Only flush for PSRAM (external RAM) - internal SRAM doesn't need cache sync
-  // This handles ESP32-C6 automatically: C6 uses internal RAM, so esp_ptr_external_ram()
-  // returns false and we skip the msync (which would be unnecessary overhead).
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
+  // Only flush for PSRAM (external RAM); internal SRAM does not need cache sync.
   if (!dma_buffers_[active_idx_] || !esp_ptr_external_ram(dma_buffers_[active_idx_])) {
     return;
   }
@@ -974,6 +972,7 @@ void ParlioDma::flush_cache_to_dma() {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
   }
+#endif
 }
 
 bool ParlioDma::build_transaction_queue() {

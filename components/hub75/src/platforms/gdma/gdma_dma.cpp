@@ -37,7 +37,10 @@
 // Header location changed in ESP-IDF 5.0
 #if (ESP_IDF_VERSION_MAJOR >= 5)
 #include <esp_private/periph_ctrl.h>
+#include <esp_memory_utils.h>
+#include <esp_cache.h>
 #else
+#include "rom/cache.h"
 #include <driver/periph_ctrl.h>
 #endif
 #include <esp_heap_caps.h>
@@ -395,10 +398,18 @@ bool GdmaDma::allocate_row_buffers() {
   size_t pixels_per_bitplane = dma_width_;  // DMA buffer width (all panels chained horizontally)
   size_t buffer_size_per_row = pixels_per_bitplane * bit_depth_ * 2;  // uint16_t = 2 bytes
   size_t total_buffer_size = num_rows_ * buffer_size_per_row;
+  total_buffer_bytes_ = total_buffer_size;
+
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
+  static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM;
+  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (PSRAM)", total_buffer_size, num_rows_);
+#else
+  static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
+  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (internal RAM)", total_buffer_size, num_rows_);
+#endif
 
   // Always allocate first buffer (buffer A, index 0)
-  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows", total_buffer_size, num_rows_);
-  dma_buffers_[0] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
+  dma_buffers_[0] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, DMA_MEM_CAPS);
   if (!dma_buffers_[0]) {
     ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer A", total_buffer_size);
     return false;
@@ -425,7 +436,7 @@ bool GdmaDma::allocate_row_buffers() {
   // Conditionally allocate second buffer (buffer B, index 1)
   if (config_.double_buffer) {
     ESP_LOGI(TAG, "Allocating buffer B: %zu bytes (double buffering enabled)", total_buffer_size);
-    dma_buffers_[1] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, MALLOC_CAP_DMA);
+    dma_buffers_[1] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, DMA_MEM_CAPS);
     if (!dma_buffers_[1]) {
       ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B", total_buffer_size);
       // Continue in single-buffer mode
@@ -729,6 +740,9 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       HUB75_PROFILE_PIXEL();
     }
   }
+  if (!config_.double_buffer) {
+    flush_cache_to_dma();
+  }
 }
 
 void GdmaDma::clear() {
@@ -749,6 +763,9 @@ void GdmaDma::clear() {
         buf[x] &= ~RGB_MASK;
       }
     }
+  }
+  if (!config_.double_buffer) {
+    flush_cache_to_dma();
   }
 }
 
@@ -850,6 +867,9 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
       }
     }
   }
+  if (!config_.double_buffer) {
+    flush_cache_to_dma();
+  }
 }
 
 void GdmaDma::flip_buffer() {
@@ -857,6 +877,10 @@ void GdmaDma::flip_buffer() {
   if (!row_buffers_[1] || !descriptors_[1]) {
     return;
   }
+
+  // Flush CPU cache for active buffer BEFORE swap (buffer we were drawing to)
+  // Only needed in double buffer mode (draw/clear/fill skip flush, defer to here)
+  flush_cache_to_dma();
 
   // Seamless descriptor chain redirection (no stop/start!)
   //
@@ -1153,6 +1177,8 @@ void GdmaDma::set_brightness_oe() {
     }
   }
 
+  flush_cache_to_dma();
+
   ESP_LOGD(TAG, "Brightness OE configuration complete");
 }
 
@@ -1344,6 +1370,26 @@ void GdmaDma::calculate_bcm_timings() {
   }
 
   ESP_LOGI(TAG, "BCM timing calculated (lsbMsbTransitionBit used by set_brightness_oe for OE control)");
+}
+
+void GdmaDma::flush_cache_to_dma() {
+#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
+  // Only flush for PSRAM (external RAM); internal SRAM does not need cache sync.
+#if (ESP_IDF_VERSION_MAJOR >= 5)
+  if (!dma_buffers_[active_idx_] || !esp_ptr_external_ram(dma_buffers_[active_idx_])) {
+    return;
+  }
+
+  // Flush cache: CPU cache → PSRAM (C2M = Cache to Memory)
+  esp_err_t err = esp_cache_msync(dma_buffers_[active_idx_], total_buffer_bytes_,
+                                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
+  }
+#else
+  Cache_WriteBack_Addr((uint32_t) dma_buffers_[active_idx_], total_buffer_bytes_);
+#endif
+#endif
 }
 
 // ============================================================================
