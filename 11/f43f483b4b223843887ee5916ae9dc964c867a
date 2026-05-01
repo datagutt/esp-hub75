@@ -1,0 +1,23 @@
+components/hub75/src/platforms/i2s/i2s_dma.cpp
+  4513f213417c307a 321-322,324-329,332
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "11f43f483b4b223843887ee5916ae9dc964c867a",
+  "prompts": {
+    "4513f213417c307a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c63a145f-8274-40a5-9c2b-15379e264cd9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Thomas Lekanger",
+      "messages": [],
+      "total_additions": 21,
+      "total_deletions": 8,
+      "accepted_lines": 962,
+      "overriden_lines": 0
+    }
+  }
+}
