@@ -141,7 +141,8 @@ bool GdmaDma::init() {
   // the beta2 API change (soc/gdma_channel.h was removed in the same refactor).
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0) && !__has_include("soc/gdma_channel.h")
   // ESP-IDF >= 6.0-beta2: simplified config, direction via NULL parameter
-  gdma_channel_alloc_config_t dma_alloc_config = {.flags = {.isr_cache_safe = 0}};
+  gdma_channel_alloc_config_t dma_alloc_config = {.intr_priority = 0,
+                                                  .flags = {.isr_cache_safe = 0}};
   esp_err_t err = gdma_new_ahb_channel(&dma_alloc_config, &dma_chan_, nullptr);
 
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
