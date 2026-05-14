@@ -375,11 +375,11 @@ void ParlioDma::configure_gpio() {
   // PARLIO handles GPIO routing internally based on data_gpio_nums
   // We only need to set drive strength for better signal integrity
 
-  gpio_num_t all_pins[] = {(gpio_num_t) config_.pins.r1, (gpio_num_t) config_.pins.g1,  (gpio_num_t) config_.pins.b1,
-                           (gpio_num_t) config_.pins.r2, (gpio_num_t) config_.pins.g2,  (gpio_num_t) config_.pins.b2,
-                           (gpio_num_t) config_.pins.a,  (gpio_num_t) config_.pins.b,   (gpio_num_t) config_.pins.c,
-                           (gpio_num_t) config_.pins.d,  (gpio_num_t) config_.pins.lat, (gpio_num_t) config_.pins.oe,
-                           (gpio_num_t) config_.pins.clk};
+  gpio_num_t all_pins[] = {(gpio_num_t) config_.pins.r1,  (gpio_num_t) config_.pins.g1,  (gpio_num_t) config_.pins.b1,
+                           (gpio_num_t) config_.pins.r2,  (gpio_num_t) config_.pins.g2,  (gpio_num_t) config_.pins.b2,
+                           (gpio_num_t) config_.pins.a,   (gpio_num_t) config_.pins.b,   (gpio_num_t) config_.pins.c,
+                           (gpio_num_t) config_.pins.d,   (gpio_num_t) config_.pins.e,   (gpio_num_t) config_.pins.lat,
+                           (gpio_num_t) config_.pins.oe,  (gpio_num_t) config_.pins.clk};
 
   for (auto pin : all_pins) {
     if (pin >= 0) {
@@ -560,15 +560,19 @@ bool ParlioDma::allocate_row_buffers() {
       // Continue with single buffer mode
       ESP_LOGW(TAG, "Continuing in single-buffer mode");
     } else {
-      // Assign pointers within buffer allocation
+      // Assign pointers within buffer allocation.
+      // Copy aligned sizes from buffer[0] rather than recomputing: recomputing
+      // skips the 32-bit alignment padding applied in the first pass, producing
+      // misaligned data pointers for every subsequent bit plane in buffer[1].
       current_ptr = dma_buffers_[1];
       for (int row = 0; row < num_rows_; row++) {
         for (int bit = 0; bit < bit_depth_; bit++) {
           int idx = (row * bit_depth_) + bit;
           BitPlaneBuffer &bp = row_buffers_[1][idx];
-          bp.pixel_words = dma_width_;
-          bp.padding_words = calculate_bcm_padding(bit);
-          bp.total_words = bp.pixel_words + bp.padding_words;
+          const BitPlaneBuffer &bp0 = row_buffers_[0][idx];
+          bp.pixel_words = bp0.pixel_words;
+          bp.padding_words = bp0.padding_words;
+          bp.total_words = bp0.total_words;
           bp.data = current_ptr;
           current_ptr += bp.total_words;
         }
@@ -673,33 +677,19 @@ void ParlioDma::initialize_buffer_internal(BitPlaneBuffer *buffers) {
       // use row 31's address because descriptor chains have no padding period.
 
       // Initialize pixel section (LAT on last pixel)
-      for (size_t x = 0; x < bp.pixel_words; x++) {
-        uint16_t word = 0;
+      uint16_t base_word = 0;
 #ifdef SOC_PARLIO_TX_CLK_SUPPORT_GATING
-        word |= (1 << CLK_GATE_BIT);  // MSB=1: enable clock during pixel shift (clock gating)
+      base_word |= static_cast<uint16_t>(1 << CLK_GATE_BIT);
 #endif
-        word |= (row_addr << ADDR_SHIFT);  // Row address
-        word |= (1 << OE_BIT);             // OE=1 (blanked during shift)
-
-        // LAT pulse on last pixel
-        if (x == bp.pixel_words - 1) {
-          word |= (1 << LAT_BIT);
-        }
-
-        // RGB data = 0 (will be set by draw_pixels)
-        bp.data[x] = word;
-      }
+      base_word |= static_cast<uint16_t>(row_addr << ADDR_SHIFT);
+      base_word |= static_cast<uint16_t>(1 << OE_BIT);
+      std::fill(bp.data, bp.data + bp.pixel_words, base_word);
+      bp.data[bp.pixel_words - 1] |= static_cast<uint16_t>(1 << LAT_BIT);
 
       // Initialize padding section (BCM display time)
-      // When clock gating supported: MSB=0 disables clock, panel displays latched data
-      // When clock gating NOT supported: padding still needed for BCM timing via buffer length
-      for (size_t i = 0; i < bp.padding_words; i++) {
-        uint16_t word = 0;                 // MSB=0 always (clock disabled if gating supported, unused otherwise)
-        word |= (row_addr << ADDR_SHIFT);  // Row address
-        word |= (1 << OE_BIT);             // Default: blanked (will be adjusted by brightness)
-
-        bp.data[bp.pixel_words + i] = word;
-      }
+      // MSB=0: clock disabled if gating supported; unused otherwise
+      const uint16_t pad_word = static_cast<uint16_t>(row_addr << ADDR_SHIFT) | static_cast<uint16_t>(1 << OE_BIT);
+      std::fill(bp.data + bp.pixel_words, bp.data + bp.total_words, pad_word);
     }
   }
 }
@@ -770,112 +760,64 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
   // User sees smooth dimming; internally we never go below the minimum.
   const int effective_brightness = min_brightness + ((brightness * (255 - min_brightness)) / 255);
 
-  for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < bit_depth_; bit++) {
-      BitPlaneBuffer &bp = buffers[(row * bit_depth_) + bit];
+  // Outer loop over bit planes so per-bit calculations are computed once across all rows.
+  // padding_words/pixel_words are identical for every row at the same bit index.
+  for (int bit = 0; bit < bit_depth_; bit++) {
+    // Use row-0 buffer to read bit-level constants (same for all rows)
+    const BitPlaneBuffer &bp0 = buffers[bit];
 
-      // For PARLIO with clock gating, brightness is controlled by OE duty cycle
-      // in the padding section (where MSB=0 and panel displays)
+    if (bp0.padding_words == 0) {
+      continue;  // No padding for this bit plane, skip all rows
+    }
 
-      if (bp.padding_words == 0) {
-        continue;  // No padding, skip
-      }
+    const int padding_available = static_cast<int>(bp0.padding_words) - config_.latch_blanking;
 
-      // CRITICAL: PARLIO Brightness Timing
-      //
-      // Unlike GDMA (which transmits constant-width buffer with repetitions),
-      // PARLIO transmits variable-width padding with NO repetitions.
-      //
-      // Example bit 7 with 50% brightness:
-      //   GDMA: 30 pixels enabled × 32 reps = 960 pixel-clocks (duty cycle 30/61 per transmission)
-      //   PARLIO: Must enable 960 words over 1952-word padding (duty cycle 960/1952 = 49.2%)
-      //
-      // Key insight: Duty cycle must match to achieve same total display time
-      // Formula: Scale padding by duty cycle factor (adjusted_base_pixels / base_pixels)
+    int max_display;
+    if (bit <= lsbMsbTransitionBit_) {
+      const int bitplane = bit_depth_ - 1 - bit;
+      const int bitshift = (bit_depth_ - lsbMsbTransitionBit_ - 1) >> 1;
+      const int rightshift = std::max(bitplane - bitshift - 2, 0);
+      max_display = padding_available >> rightshift;
+    } else {
+      max_display = padding_available;
+    }
 
-      const int padding_available = bp.padding_words - config_.latch_blanking;
-
-      // PARLIO Hybrid BCM Approach
-      //
-      // PARLIO differs from GDMA/I2S: BCM timing comes from PADDING SIZE, not descriptor
-      // repetitions. Each bit plane has different padding (bit 7 has 32x more than bit 2).
-      //
-      // This creates a TWO-TIER system:
-      //
-      // MSB bits (> lsbMsbTransitionBit): Padding size provides BCM weighting
-      //   - Bit 7 has 32x more padding than bit 2 → inherently 32x longer display time
-      //   - Using rightshift here would DOUBLE-WEIGHT them (padding ratio × OE ratio)
-      //   - Solution: Use full padding_available, let padding size control BCM
-      //
-      // LSB bits (≤ lsbMsbTransitionBit): All have IDENTICAL padding (base_padding)
-      //   - Without differentiation, bits 0 and 1 would contribute equally → wrong colors
-      //   - Solution: Apply rightshift to reduce max_display for lower bits
-      //   - Same formula as GDMA/I2S for these bits
-      int max_display;
-      if (bit <= lsbMsbTransitionBit_) {
-        // LSB bits: identical padding, need rightshift for BCM differentiation
-        const int bitplane = bit_depth_ - 1 - bit;
-        const int bitshift = (bit_depth_ - lsbMsbTransitionBit_ - 1) >> 1;
-        const int rightshift = std::max(bitplane - bitshift - 2, 0);
-        max_display = padding_available >> rightshift;
-      } else {
-        // MSB bits: padding size provides BCM timing, no rightshift needed
-        max_display = padding_available;
-      }
-
-      // Safety check: ensure we have enough headroom for safety margin
-      if (max_display < 2) {
-        // Keep all padding blanked (OE=1) since we can't create a safe display window
+    if (max_display < 2) {
+      for (int row = 0; row < num_rows_; row++) {
+        BitPlaneBuffer &bp = buffers[(row * bit_depth_) + bit];
         for (size_t i = 0; i < bp.padding_words; i++) {
           bp.data[bp.pixel_words + i] |= (1 << OE_BIT);
         }
-        continue;
       }
+      continue;
+    }
 
-      int display_count = (max_display * effective_brightness) >> 8;
+    int display_count = (max_display * effective_brightness) >> 8;
 
-      // Safety net: Hybrid minimum for edge cases (e.g., 12-bit depth, unusual latch_blanking)
-      //
-      // The brightness floor above should prevent display_count=0 for most cases.
-      // This catches edge cases where high rightshift values (at higher bit depths)
-      // could still result in display_count=0 for lower bits.
-      //
-      // Gradually include more bits: at low brightness only MSB gets minimum=1,
-      // preserving color ratios for visible bits. As brightness increases, more
-      // bits naturally exceed 0 anyway.
-      // Formula: min_bit = (bit_depth-1) - (brightness/16)
-      //   brightness 1-15:  only bit 7 gets minimum
-      //   brightness 16-31: bits 6-7 get minimum
-      //   brightness 32-47: bits 5-7 get minimum, etc.
-      const int min_bit_for_display = std::max(0, bit_depth_ - 1 - (effective_brightness >> 4));
-      if (effective_brightness > 0 && display_count == 0 && bit >= min_bit_for_display) {
-        display_count = 1;
-      }
+    const int min_bit_for_display = std::max(0, bit_depth_ - 1 - (effective_brightness >> 4));
+    if (effective_brightness > 0 && display_count == 0 && bit >= min_bit_for_display) {
+      display_count = 1;
+    }
 
-      // Safety margin: prevent ghosting by keeping at least 1 pixel blanked
-      display_count = std::min(display_count, max_display - 1);
+    display_count = std::min(display_count, max_display - 1);
 
-      // Center the display window in padding section
-      const size_t start_display = (bp.padding_words - display_count) / 2;
-      const size_t end_display = start_display + display_count;
+    const size_t start_display = (bp0.padding_words - static_cast<size_t>(display_count)) / 2;
+    const size_t end_display = start_display + static_cast<size_t>(display_count);
 
-      // Set OE bits in padding section
+    for (int row = 0; row < num_rows_; row++) {
+      BitPlaneBuffer &bp = buffers[(row * bit_depth_) + bit];
+      uint16_t *pad = bp.data + bp.pixel_words;
+
       for (size_t i = 0; i < bp.padding_words; i++) {
-        uint16_t &word = bp.data[bp.pixel_words + i];
-
         if (i >= start_display && i < end_display) {
-          // Display enabled: OE=0
-          word &= OE_CLEAR_MASK;
+          pad[i] &= OE_CLEAR_MASK;
         } else {
-          // Blanked: OE=1
-          word |= (1 << OE_BIT);
+          pad[i] |= static_cast<uint16_t>(1 << OE_BIT);
         }
       }
 
-      // CRITICAL: Latch blanking at end of padding
-      // Blank last N words to prevent ghosting during row transition
-      for (size_t i = 0; i < config_.latch_blanking && i < bp.padding_words; i++) {
-        bp.data[bp.pixel_words + bp.padding_words - 1 - i] |= (1 << OE_BIT);
+      for (size_t i = 0; i < static_cast<size_t>(config_.latch_blanking) && i < bp.padding_words; i++) {
+        pad[bp.padding_words - 1 - i] |= static_cast<uint16_t>(1 << OE_BIT);
       }
     }
   }
@@ -1221,46 +1163,49 @@ HUB75_IRAM void ParlioDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   // Check if we can use identity fast path (no coordinate transforms needed)
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
-  // Fill loop
-  for (uint16_t dy = 0; dy < h; dy++) {
-    for (uint16_t dx = 0; dx < w; dx++) {
-      uint16_t px = x + dx;
-      uint16_t py = y + dy;
+  // Fill loop — identity path uses dy→bit→dx order for sequential PSRAM access
+  if (identity_transform) {
+    for (uint16_t dy = 0; dy < h; dy++) {
+      const uint16_t py = y + dy;
       uint16_t row;
       bool is_lower;
-
-      // Fast path: identity transform (no rotation, standard layout, standard scan)
-      if (identity_transform) {
-        if (py < num_rows_) {
-          row = py;
-          is_lower = false;
-        } else {
-          row = py - num_rows_;
-          is_lower = true;
-        }
+      if (py < num_rows_) {
+        row = py;
+        is_lower = false;
       } else {
-        // Full coordinate transformation pipeline
+        row = py - num_rows_;
+        is_lower = true;
+      }
+      const uint16_t rgb_mask =
+          is_lower ? static_cast<uint16_t>(~RGB_LOWER_MASK) : static_cast<uint16_t>(~RGB_UPPER_MASK);
+      const uint16_t *patterns = is_lower ? lower_patterns : upper_patterns;
+      const int row_base_idx = row * bit_depth_;
+      for (int bit = 0; bit < bit_depth_; bit++) {
+        BitPlaneBuffer &bp = target_buffers[row_base_idx + bit];
+        const uint16_t pattern = patterns[bit];
+        uint16_t *row_ptr = bp.data + x;
+        for (uint16_t dx = 0; dx < w; dx++) {
+          row_ptr[dx] = (row_ptr[dx] & rgb_mask) | pattern;
+        }
+      }
+    }
+  } else {
+    for (uint16_t dy = 0; dy < h; dy++) {
+      for (uint16_t dx = 0; dx < w; dx++) {
+        uint16_t px = x + dx;
+        uint16_t py = y + dy;
         auto transformed = transform_coordinate(px, py, rotation_, needs_layout_remap_, needs_scan_remap_, layout_,
                                                 scan_wiring_, panel_width_, panel_height_, layout_rows_, layout_cols_,
                                                 virtual_width_, virtual_height_, dma_width_, num_rows_);
         px = transformed.x;
-        row = transformed.row;
-        is_lower = transformed.is_lower;
-      }
-
-      // Update all bit planes using pre-computed patterns
-      const int row_base_idx = row * bit_depth_;
-      for (int bit = 0; bit < bit_depth_; bit++) {
-        BitPlaneBuffer &bp = target_buffers[row_base_idx + bit];
-        uint16_t word = bp.data[px];  // Read existing word (preserves control bits)
-
-        if (is_lower) {
-          word = (word & ~RGB_LOWER_MASK) | lower_patterns[bit];
-        } else {
-          word = (word & ~RGB_UPPER_MASK) | upper_patterns[bit];
+        const int row_base_idx = transformed.row * bit_depth_;
+        const uint16_t rgb_mask = transformed.is_lower ? static_cast<uint16_t>(~RGB_LOWER_MASK)
+                                                       : static_cast<uint16_t>(~RGB_UPPER_MASK);
+        const uint16_t *patterns = transformed.is_lower ? lower_patterns : upper_patterns;
+        for (int bit = 0; bit < bit_depth_; bit++) {
+          BitPlaneBuffer &bp = target_buffers[row_base_idx + bit];
+          bp.data[px] = (bp.data[px] & rgb_mask) | patterns[bit];
         }
-
-        bp.data[px] = word;
       }
     }
   }
