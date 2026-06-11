@@ -141,8 +141,7 @@ bool GdmaDma::init() {
   // Allocate GDMA channel
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
   // ESP-IDF 6.0+: simplified config, direction via NULL parameter
-  gdma_channel_alloc_config_t dma_alloc_config = {.intr_priority = 0,
-                                                  .flags = {.isr_cache_safe = 0}};
+  gdma_channel_alloc_config_t dma_alloc_config = {.intr_priority = 0, .flags = {.isr_cache_safe = 0}};
   esp_err_t err = gdma_new_ahb_channel(&dma_alloc_config, &dma_chan_, nullptr);
 
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
@@ -218,7 +217,7 @@ bool GdmaDma::init() {
   // Register frame callback if already set
   if (frame_callback_) {
     gdma_tx_event_callbacks_t cbs = {};
-      cbs.on_trans_eof = GdmaDma::on_trans_eof;
+    cbs.on_trans_eof = GdmaDma::on_trans_eof;
     gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
   }
   // The descriptor chain encodes all timing via repetition counts
@@ -725,7 +724,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       pixel_ptr += pixel_stride;
 
       // Select upper or lower cached patterns based on half
-      id_patterns = (clear_mask == (uint16_t)~RGB_LOWER_MASK) ? cached_lower_patterns_ : cached_upper_patterns_;
+      id_patterns = (clear_mask == (uint16_t) ~RGB_LOWER_MASK) ? cached_lower_patterns_ : cached_upper_patterns_;
 
       // Apply cached patterns to all bit planes (branch-free inner loop)
       for (int bit = 0; bit < bit_depth_; bit++) {
