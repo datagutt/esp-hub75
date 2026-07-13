@@ -1,0 +1,28 @@
+components/hub75/src/platforms/i2s/i2s_dma.cpp
+  s_a92a4ecce435bb::t_b025c0733c31a1 441
+  s_a92a4ecce435bb::t_0db15e4e24b053 425-426,432
+components/hub75/include/hub75_types.h
+  s_a92a4ecce435bb::t_de9b385627913d 210-215
+components/hub75/src/platforms/gdma/gdma_dma.cpp
+  s_a92a4ecce435bb::t_7bae60edf945c4 389
+  s_a92a4ecce435bb::t_52c2bf53181096 377
+  s_a92a4ecce435bb::t_69ff2c3f87e7f5 366-367
+components/hub75/src/platforms/parlio/parlio_dma.cpp
+  s_a92a4ecce435bb::t_368fa7f2ae3718 427-428,431,435
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.11",
+  "base_commit_sha": "ab261ff7078092a1facf3dc87319543578d0bf1e",
+  "prompts": {},
+  "sessions": {
+    "s_a92a4ecce435bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6bab216-8550-4dc3-9978-2748ef1f0ce4",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Thomas Lekanger <thomas.lekanger@hotmail.com>"
+    }
+  }
+}
