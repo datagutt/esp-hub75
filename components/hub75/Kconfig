@@ -682,6 +682,17 @@ menu "HUB75 RGB LED Matrix Driver"
 
     menu "Features"
 
+        config HUB75_GPIO_DRIVE_STRENGTH
+            int "GPIO drive strength for panel pins (0-3)"
+            range 0 3
+            default 3
+            help
+                Drive strength for all HUB75 output pins. 0 is roughly 5mA,
+                3 is roughly 40mA. Higher values give faster edges and more
+                EMI. On WiFi SoCs the panel bus harmonics can desense the
+                2.4GHz radio (packet loss, large RTTs). Use the lowest level
+                that still gives clean video for the panel and cabling.
+
         config HUB75_DOUBLE_BUFFER
             bool "Enable double buffering"
             default n
