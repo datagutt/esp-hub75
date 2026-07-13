@@ -363,6 +363,8 @@ void GdmaDma::configure_gpio() {
       -1  // D13-D15 unused
   };
 
+  gpio_drive_cap_t drive = (gpio_drive_cap_t) (config_.gpio_drive_strength > 3 ? 3 : config_.gpio_drive_strength);
+
   // Configure data pins
   for (int i = 0; i < 16; i++) {
     if (data_pins[i] >= 0) {
@@ -372,7 +374,7 @@ void GdmaDma::configure_gpio() {
 #else
       gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[data_pins[i]], PIN_FUNC_GPIO);
 #endif
-      gpio_set_drive_capability((gpio_num_t) data_pins[i], GPIO_DRIVE_CAP_3);  // Max drive strength
+      gpio_set_drive_capability((gpio_num_t) data_pins[i], drive);
     }
   }
 
@@ -384,7 +386,7 @@ void GdmaDma::configure_gpio() {
 #else
     gpio_hal_iomux_func_sel(GPIO_PIN_MUX_REG[config_.pins.clk], PIN_FUNC_GPIO);
 #endif
-    gpio_set_drive_capability((gpio_num_t) config_.pins.clk, GPIO_DRIVE_CAP_3);  // Max drive strength
+    gpio_set_drive_capability((gpio_num_t) config_.pins.clk, drive);
   }
 
   ESP_LOGD(TAG, "GPIO routing configured");

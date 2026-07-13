@@ -207,6 +207,12 @@ struct Hub75Config {
   Hub75ClockSpeed output_clock_speed = Hub75ClockSpeed::HZ_20M;  // Output clock speed (default: 20MHz)
   uint16_t min_refresh_rate = 60;                                // Minimum refresh rate in Hz (default: 60)
 
+  // GPIO drive strength for all HUB75 output pins, 0-3 (0 is ~5mA, 3 is ~40mA).
+  // Higher = faster edges = more EMI: on WiFi SoCs the panel bus harmonics
+  // can desense the 2.4GHz radio (packet loss, huge RTTs). Prefer the lowest
+  // level that still gives clean video for the panel/cable in use.
+  uint8_t gpio_drive_strength = 3;
+
   // ========================================
   // Timing
   // ========================================

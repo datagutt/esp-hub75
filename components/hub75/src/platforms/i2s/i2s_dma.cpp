@@ -422,12 +422,14 @@ void I2sDma::configure_gpio() {
       -1                 // D15 unused
   };
 
+  gpio_drive_cap_t drive = (gpio_drive_cap_t) (config_.gpio_drive_strength > 3 ? 3 : config_.gpio_drive_strength);
+
   // Initialize all GPIO pins
   for (int i = 0; i < 16; i++) {
     if (pin_map[i] >= 0) {
       esp_rom_gpio_pad_select_gpio(pin_map[i]);
       gpio_set_direction((gpio_num_t) pin_map[i], GPIO_MODE_OUTPUT);
-      gpio_set_drive_capability((gpio_num_t) pin_map[i], GPIO_DRIVE_CAP_3);
+      gpio_set_drive_capability((gpio_num_t) pin_map[i], drive);
       esp_rom_gpio_connect_out_signal(pin_map[i], iomux_signal_base + i, false, false);
     }
   }
@@ -436,7 +438,7 @@ void I2sDma::configure_gpio() {
   if (config_.pins.clk >= 0) {
     esp_rom_gpio_pad_select_gpio(config_.pins.clk);
     gpio_set_direction((gpio_num_t) config_.pins.clk, GPIO_MODE_OUTPUT);
-    gpio_set_drive_capability((gpio_num_t) config_.pins.clk, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability((gpio_num_t) config_.pins.clk, drive);
     esp_rom_gpio_connect_out_signal(config_.pins.clk, iomux_clock, config_.clk_phase_inverted, false);
   }
 

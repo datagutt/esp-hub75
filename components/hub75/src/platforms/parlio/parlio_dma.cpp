@@ -424,13 +424,15 @@ void ParlioDma::configure_gpio() {
                            (gpio_num_t) config_.pins.d,  (gpio_num_t) config_.pins.e,  (gpio_num_t) config_.pins.lat,
                            (gpio_num_t) config_.pins.oe, (gpio_num_t) config_.pins.clk};
 
+  gpio_drive_cap_t drive = (gpio_drive_cap_t) (config_.gpio_drive_strength > 3 ? 3 : config_.gpio_drive_strength);
+
   for (auto pin : all_pins) {
     if (pin >= 0) {
-      gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_3);  // Maximum drive strength
+      gpio_set_drive_capability(pin, drive);
     }
   }
 
-  ESP_LOGI(TAG, "GPIO drive strength configured (max)");
+  ESP_LOGI(TAG, "GPIO drive strength configured (level %d)", (int) drive);
 }
 void ParlioDma::calculate_bcm_timings() {
   // Calculate base buffer transmission time
