@@ -1,0 +1,21 @@
+components/hub75/src/platforms/gdma/gdma_dma.cpp
+  s_a92a4ecce435bb::t_1c6cc2cad0062b 640-704
+  s_a92a4ecce435bb::t_806598073cbfb4 867
+  s_a92a4ecce435bb::t_6eddcc64628a2d 780,795,819,925,1023,1127,1148,1257,1297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.11",
+  "base_commit_sha": "a9a7bfaf2df51e2dc04687aeb9e5cc8a5787313a",
+  "prompts": {},
+  "sessions": {
+    "s_a92a4ecce435bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a6bab216-8550-4dc3-9978-2748ef1f0ce4",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Thomas Lekanger <thomas.lekanger@hotmail.com>"
+    }
+  }
+}
