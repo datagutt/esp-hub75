@@ -1,0 +1,20 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.11",
+  "base_commit_sha": "9b1041d26991a51ada521d2b05e03f13b43c1617",
+  "prompts": {
+    "4513f213417c307a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c63a145f-8274-40a5-9c2b-15379e264cd9",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Thomas Lekanger <thomas.lekanger@hotmail.com>",
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 1446,
+      "overriden_lines": 0
+    }
+  }
+}
