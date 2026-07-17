@@ -16,6 +16,12 @@
 #include <esp_attr.h>
 #endif
 
+#if __has_include(<esp_heap_caps.h>)
+#include <esp_heap_caps.h>
+#include <stdlib.h>
+#define HUB75_HAS_HEAP_CAPS 1
+#endif
+
 #include "hub75_types.h"
 #include "hub75_config.h"
 #include "hub75_internal.h"  // Internal types (framebuffer format)
@@ -35,6 +41,17 @@ class PlatformDma;
  */
 class Hub75Driver {
  public:
+#ifdef HUB75_HAS_HEAP_CAPS
+  // Keep the driver object in internal RAM even when CONFIG_SPIRAM_USE_MALLOC
+  // routes large allocations to PSRAM; the platform DMA layer applies the
+  // same policy to the object holding the per-pixel LUT and pattern caches.
+  static void *operator new(size_t size) {
+    void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p ? p : malloc(size);
+  }
+  static void operator delete(void *p) { heap_caps_free(p); }
+#endif
+
   /**
    * @brief Construct a new Hub75 driver
    * @param config Driver configuration

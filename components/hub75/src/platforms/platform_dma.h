@@ -17,8 +17,10 @@
 #include "../panels/scan_patterns.h"  // For Coords and ScanPatternRemap
 #include "../panels/panel_layout.h"   // For PanelLayoutRemap
 #include "../panels/rotation.h"       // For RotationTransform
+#include <esp_heap_caps.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 namespace hub75 {
 
@@ -31,6 +33,16 @@ namespace hub75 {
 class PlatformDma {
  public:
   virtual ~PlatformDma() = default;
+
+  // draw_pixels() reads the LUT and pattern caches embedded in this object on
+  // every pixel. With CONFIG_SPIRAM_USE_MALLOC a plain `new` places objects
+  // this large in PSRAM, turning those accesses into PSRAM cache traffic, so
+  // keep the object in internal RAM (PSRAM only as a last resort).
+  static void *operator new(size_t size) {
+    void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    return p ? p : malloc(size);
+  }
+  static void operator delete(void *p) { heap_caps_free(p); }
 
   /**
    * @brief Register a callback to be called on each frame completion
