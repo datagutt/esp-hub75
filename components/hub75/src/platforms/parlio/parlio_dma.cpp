@@ -71,7 +71,7 @@ constexpr uint16_t RGB_CLEAR_MASK = ~RGB_MASK;  // Clear RGB bits 0-5
 ParlioDma::ParlioDma(const Hub75Config &config)
     : PlatformDma(config),
       tx_unit_(nullptr),
-      bit_depth_(HUB75_BIT_DEPTH),
+      bit_depth_(resolve_bit_depth(config)),
       lsbMsbTransitionBit_(0),
       actual_clock_hz_(resolve_actual_clock_speed(config.output_clock_speed)),
       panel_width_(config.panel_width),
@@ -1202,8 +1202,8 @@ HUB75_IRAM void ParlioDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
 
   // Pre-compute bit patterns for all bit planes (ONCE for entire fill)
   // PARLIO bit layout: R1=5, R2=4, G1=3, G2=2, B1=1, B2=0
-  uint16_t upper_patterns[HUB75_BIT_DEPTH];
-  uint16_t lower_patterns[HUB75_BIT_DEPTH];
+  uint16_t upper_patterns[HUB75_MAX_BIT_DEPTH];
+  uint16_t lower_patterns[HUB75_MAX_BIT_DEPTH];
   for (int bit = 0; bit < bit_depth_; bit++) {
     const uint16_t mask = (1 << bit);
     upper_patterns[bit] = ((r_corrected & mask) ? (1 << R1_BIT) : 0) | ((g_corrected & mask) ? (1 << G1_BIT) : 0) |

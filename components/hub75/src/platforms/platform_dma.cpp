@@ -17,8 +17,23 @@ namespace hub75 {
 PlatformDma::PlatformDma(const Hub75Config &config) : config_(config) {
   // Copy compile-time LUT as default (may be adjusted by BCM correction in derived classes)
   std::memcpy(lut_, get_lut(), 256 * sizeof(uint16_t));
+
+  // The compile-time LUT saturates at (1 << HUB75_BIT_DEPTH) - 1. When a
+  // different runtime depth is requested, rescale so the curve spans the new
+  // range. Scaling by max-value ratio rather than a bit shift keeps the
+  // endpoints exact: shifting left would cap white at 0xFF0 instead of 0xFFF
+  // for an 8-bit LUT driving 12 planes, dimming full white by ~0.4%.
+  const uint8_t depth = resolve_bit_depth(config);
+  if (depth != HUB75_BIT_DEPTH) {
+    const uint32_t old_max = (1u << HUB75_BIT_DEPTH) - 1u;
+    const uint32_t new_max = (1u << depth) - 1u;
+    for (int i = 0; i < 256; i++) {
+      lut_[i] = static_cast<uint16_t>((static_cast<uint32_t>(lut_[i]) * new_max) / old_max);
+    }
+  }
+
   const char *gamma_name = HUB75_GAMMA_MODE == 0 ? "Linear" : HUB75_GAMMA_MODE == 1 ? "CIE1931" : "Gamma2.2";
-  ESP_LOGI(TAG, "Initialized %s LUT for %d-bit depth", gamma_name, HUB75_BIT_DEPTH);
+  ESP_LOGI(TAG, "Initialized %s LUT for %u-bit depth", gamma_name, depth);
 }
 
 void PlatformDma::init_brightness_coeffs(uint16_t dma_width, uint8_t latch_blanking) {

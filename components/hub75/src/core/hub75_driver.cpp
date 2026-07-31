@@ -50,12 +50,21 @@ Hub75Driver::Hub75Driver(const Hub75Config &config) : config_(config), running_(
            (unsigned int) config_.panel_height, (unsigned int) config_.layout_cols, (unsigned int) config_.layout_rows,
            (unsigned int) (config_.panel_width * config_.layout_cols),
            (unsigned int) (config_.panel_height * config_.layout_rows));
-  ESP_LOGI(TAG, "Config: %u-bit depth (compile-time), %u row addresses, four-scan: %s", HUB75_BIT_DEPTH,
+  ESP_LOGI(TAG, "Config: %u-bit depth, %u row addresses, four-scan: %s", resolve_bit_depth(config_),
            (unsigned int) get_effective_num_rows(config_.scan_wiring, config_.panel_height),
            is_four_scan_wiring(config_.scan_wiring) ? "yes" : "no");
 }
 
 Hub75Driver::~Hub75Driver() { end(); }
+
+bool Hub75Driver::set_config(const Hub75Config &config) {
+  if (running_) {
+    ESP_LOGE(TAG, "set_config() requires the driver to be stopped (call end() first)");
+    return false;
+  }
+  config_ = config;
+  return true;
+}
 
 // ============================================================================
 // Initialization

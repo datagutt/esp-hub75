@@ -25,6 +25,22 @@
 namespace hub75 {
 
 /**
+ * @brief Resolve the effective bit depth for a config
+ * @param config Driver configuration (bit_depth == 0 means compile-time default)
+ * @return Bit depth clamped to 4..HUB75_MAX_BIT_DEPTH
+ *
+ * Every platform sizes its DMA buffers, descriptor chain and bit-plane loops
+ * from this one value, so they stay consistent with the LUT rescaling done in
+ * the PlatformDma constructor.
+ */
+inline uint8_t resolve_bit_depth(const Hub75Config &config) {
+  int depth = config.bit_depth ? config.bit_depth : HUB75_BIT_DEPTH;
+  if (depth < 4) depth = 4;
+  if (depth > HUB75_MAX_BIT_DEPTH) depth = HUB75_MAX_BIT_DEPTH;
+  return static_cast<uint8_t>(depth);
+}
+
+/**
  * @brief Platform-agnostic DMA interface
  *
  * Each platform (ESP32, ESP32-S3, etc.) implements this interface

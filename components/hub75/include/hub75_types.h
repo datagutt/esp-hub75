@@ -231,6 +231,16 @@ struct Hub75Config {
   // ========================================
 
   uint8_t brightness = 128;  // Initial brightness 0-255 (default: 128)
+
+  // Color bit depth per channel, 4..HUB75_MAX_BIT_DEPTH. 0 selects the
+  // compile-time default (HUB75_BIT_DEPTH).
+  //
+  // The gamma LUT is generated at compile time for HUB75_BIT_DEPTH and rescaled
+  // to this depth at construction, so a depth above the compile-time value adds
+  // bit planes (finer BCM weighting, more DMA memory and descriptors) but no
+  // additional gamma resolution. Read during begin(), so changing it at runtime
+  // is end() then set_config() then begin().
+  uint8_t bit_depth = 0;
 };
 
 // ============================================================================

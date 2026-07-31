@@ -75,6 +75,16 @@ class Hub75Driver {
   void end();
 
   /**
+   * @brief Replace the driver configuration
+   * @param config New configuration, applied on the next begin()
+   * @return true if accepted, false if the driver is still running
+   *
+   * Hardware parameters (bit depth, clock speed, panel geometry) are read once
+   * during begin(), so changing them means end() then set_config() then begin().
+   */
+  bool set_config(const Hub75Config &config);
+
+  /**
    * @brief Register a callback to be called on each frame completion
    *
    * This callback is executed from an ISR.

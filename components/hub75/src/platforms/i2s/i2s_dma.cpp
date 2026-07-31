@@ -105,7 +105,7 @@ __attribute__((always_inline)) HUB75_CONST static inline constexpr uint16_t fifo
 I2sDma::I2sDma(const Hub75Config &config)
     : PlatformDma(config),
       i2s_dev_(nullptr),
-      bit_depth_(HUB75_BIT_DEPTH),
+      bit_depth_(resolve_bit_depth(config)),
       lsbMsbTransitionBit_(0),
       actual_clock_hz_(resolve_actual_clock_speed(config.output_clock_speed)),
       panel_width_(config.panel_width),
@@ -1238,8 +1238,8 @@ HUB75_IRAM void I2sDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uin
 
   // Pre-compute bit patterns for all bit planes (ONCE for entire fill)
   // This eliminates per-pixel bit extraction and conditional logic
-  uint16_t upper_patterns[HUB75_BIT_DEPTH];
-  uint16_t lower_patterns[HUB75_BIT_DEPTH];
+  uint16_t upper_patterns[HUB75_MAX_BIT_DEPTH];
+  uint16_t lower_patterns[HUB75_MAX_BIT_DEPTH];
   for (int bit = 0; bit < bit_depth_; bit++) {
     const uint16_t mask = BCM_BIT_MASKS[bit];
     upper_patterns[bit] = ((r_corrected & mask) ? (1 << R1_BIT) : 0) | ((g_corrected & mask) ? (1 << G1_BIT) : 0) |

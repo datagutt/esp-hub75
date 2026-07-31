@@ -80,7 +80,7 @@ constexpr uint16_t OE_CLEAR_MASK = ~(1 << OE_BIT);
 GdmaDma::GdmaDma(const Hub75Config &config)
     : PlatformDma(config),
       dma_chan_(nullptr),
-      bit_depth_(HUB75_BIT_DEPTH),
+      bit_depth_(resolve_bit_depth(config)),
       lsbMsbTransitionBit_(0),
       actual_clock_hz_(resolve_actual_clock_speed(config.output_clock_speed)),
       panel_width_(config.panel_width),
@@ -650,7 +650,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
     // Pair cache: frames are dominated by flat color runs, so the merged bit
     // patterns are reused while both halves keep the same raw value.
     uint32_t cached_upper_raw = 0, cached_lower_raw = 0;
-    uint16_t pair_patterns[HUB75_BIT_DEPTH];
+    uint16_t pair_patterns[HUB75_MAX_BIT_DEPTH];
     bool pair_cache_valid = false;
 
     for (uint16_t row = 0; row < num_rows_; row++) {
@@ -678,7 +678,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
           const uint16_t ur_c = lut_[ur], ug_c = lut_[ug], ub_c = lut_[ub];
           const uint16_t lr_c = lut_[lr], lg_c = lut_[lg], lb_c = lut_[lb];
 
-          for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+          for (int bit = 0; bit < bit_depth_; bit++) {
             pair_patterns[bit] = (((ur_c >> bit) & 1) << R1_BIT) | (((ug_c >> bit) & 1) << G1_BIT) |
                                  (((ub_c >> bit) & 1) << B1_BIT) | (((lr_c >> bit) & 1) << R2_BIT) |
                                  (((lg_c >> bit) & 1) << G2_BIT) | (((lb_c >> bit) & 1) << B2_BIT);
@@ -691,7 +691,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         lower_ptr += pixel_stride;
 
         uint8_t *plane_ptr = base_ptr;
-        for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+        for (int bit = 0; bit < bit_depth_; bit++) {
           uint16_t *buf = (uint16_t *) plane_ptr;
           buf[px] = (buf[px] & (uint16_t) ~RGB_MASK) | pair_patterns[bit];
           plane_ptr += bit_plane_stride;
@@ -779,7 +779,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         HUB75_PROFILE_STAGE(PROFILE_LUT);
 
         // Pre-compute bit patterns for all bit planes using branchless bit extraction
-        for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+        for (int bit = 0; bit < bit_depth_; bit++) {
           const uint16_t r_bit = (r_corrected >> bit) & 1;
           const uint16_t g_bit = (g_corrected >> bit) & 1;
           const uint16_t b_bit = (b_corrected >> bit) & 1;
@@ -794,7 +794,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       id_patterns = (clear_mask == (uint16_t) ~RGB_LOWER_MASK) ? cached_lower_patterns_ : cached_upper_patterns_;
 
       // Apply cached patterns to all bit planes (branch-free inner loop)
-      for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+      for (int bit = 0; bit < bit_depth_; bit++) {
         uint16_t *buf = (uint16_t *) (base_ptr + (bit * bit_plane_stride));
         buf[px] = (buf[px] & clear_mask) | id_patterns[bit];
       }
@@ -818,7 +818,7 @@ void GdmaDma::clear() {
 
   // Clear RGB bits in all buffers (keep control bits)
   for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+    for (int bit = 0; bit < bit_depth_; bit++) {
       uint16_t *buf = (uint16_t *) (target_buffers[row].data + (bit * dma_width_ * 2));
 
       for (uint16_t x = 0; x < dma_width_; x++) {
@@ -864,9 +864,9 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
 
   // Pre-compute bit patterns for all bit planes (ONCE for entire fill)
   // This eliminates per-pixel bit extraction and conditional logic
-  uint16_t upper_patterns[HUB75_BIT_DEPTH];
-  uint16_t lower_patterns[HUB75_BIT_DEPTH];
-  for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+  uint16_t upper_patterns[HUB75_MAX_BIT_DEPTH];
+  uint16_t lower_patterns[HUB75_MAX_BIT_DEPTH];
+  for (int bit = 0; bit < bit_depth_; bit++) {
     const uint16_t mask = (1 << bit);
     upper_patterns[bit] = ((r_corrected & mask) ? (1 << R1_BIT) : 0) | ((g_corrected & mask) ? (1 << G1_BIT) : 0) |
                           ((b_corrected & mask) ? (1 << B1_BIT) : 0);
@@ -924,7 +924,7 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
       }
 
       // Update all bit planes (branch-free inner loop)
-      for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+      for (int bit = 0; bit < bit_depth_; bit++) {
         uint16_t *buf = (uint16_t *) (base_ptr + (bit * bit_plane_stride));
         buf[px] = (buf[px] & clear_mask) | patterns[bit];
       }
@@ -1022,7 +1022,7 @@ void GdmaDma::initialize_buffer_internal(RowBitPlaneBuffer *buffers) {
   for (int row = 0; row < num_rows_; row++) {
     uint16_t row_addr = row & ADDR_MASK;
 
-    for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+    for (int bit = 0; bit < bit_depth_; bit++) {
       uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
 
       // Row address handling: LSB bit plane uses previous row for LAT settling
@@ -1126,7 +1126,7 @@ void GdmaDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t bri
   // brightness=0 blanks the display entirely
   if (brightness == 0) {
     for (int row = 0; row < num_rows_; row++) {
-      for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+      for (int bit = 0; bit < bit_depth_; bit++) {
         uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
         for (int x = 0; x < dma_width_; x++) {
           buf[x] |= (1 << OE_BIT);
@@ -1147,7 +1147,7 @@ void GdmaDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t bri
   const int effective_brightness = remap_brightness(brightness);
 
   for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+    for (int bit = 0; bit < bit_depth_; bit++) {
       uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
 
       // Uniform OE duty cycle: same display_pixels count for all bit planes.
@@ -1256,7 +1256,7 @@ bool GdmaDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, dma_de
   // Link descriptors with BCM repetitions
   size_t desc_idx = 0;
   for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+    for (int bit = 0; bit < bit_depth_; bit++) {
       uint8_t *const bit_buffer = buffers[row].data + (bit * bytes_per_bitplane);
 
       // Calculate number of descriptor repetitions for this bit plane
@@ -1296,7 +1296,7 @@ bool GdmaDma::build_descriptor_chain() {
   // For bits > lsbMsbTransitionBit: 2^(bit - lsbMsbTransitionBit - 1) descriptors each
   descriptor_count_ = 0;
   for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < HUB75_BIT_DEPTH; bit++) {
+    for (int bit = 0; bit < bit_depth_; bit++) {
       if (bit <= lsbMsbTransitionBit_) {
         descriptor_count_ += 1;  // Base timing
       } else {
