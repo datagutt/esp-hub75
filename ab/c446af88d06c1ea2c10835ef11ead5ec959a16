@@ -1,0 +1,47 @@
+components/hub75/src/platforms/gdma/gdma_dma.cpp
+  s_3607b8f5ca7a9a::t_1a6a26eced25ea 681,694,782,797,821,869,927,1025,1129,1150,1259,1299
+  s_3607b8f5ca7a9a::t_383a592e8f798d 83
+  s_3607b8f5ca7a9a::t_44edb130e7e839 653
+  s_3607b8f5ca7a9a::t_7ca5dac9d44ad7 867-868
+components/hub75/include/hub75.h
+  s_3607b8f5ca7a9a::t_6e2f2497185cc9 61-69
+  s_3607b8f5ca7a9a::t_7cb2b433713c9d 60
+components/hub75/src/platforms/i2s/i2s_dma.cpp
+  s_3607b8f5ca7a9a::t_67d4a6c8f132cd 108
+  s_3607b8f5ca7a9a::t_41eaeafcdd8a42 1241-1242
+components/hub75/src/platforms/platform_dma.h
+  s_3607b8f5ca7a9a::t_9b774ec4db4e1e 26-40
+  s_3607b8f5ca7a9a::t_2dc7ea4e0ffffc 25
+components/hub75/src/platforms/platform_dma.cpp
+  s_3607b8f5ca7a9a::t_483d02a5622466 20-34,36
+components/hub75/src/platforms/i2s/i2s_dma.h
+  s_3607b8f5ca7a9a::t_d3258b8fd73dc0 181-183
+components/hub75/src/platforms/gdma/gdma_dma.h
+  s_3607b8f5ca7a9a::t_824626bbab5410 192-194
+components/hub75/src/core/hub75_driver.cpp
+  s_3607b8f5ca7a9a::t_70a3cbe06c5347 53,60-67
+  s_3607b8f5ca7a9a::t_5dc9b8da16cceb 68
+components/hub75/src/platforms/parlio/parlio_dma.h
+  s_3607b8f5ca7a9a::t_8ea81f36b51e64 193-195
+components/hub75/src/platforms/parlio/parlio_dma.cpp
+  s_3607b8f5ca7a9a::t_127820c480978e 74
+  s_3607b8f5ca7a9a::t_d49323a54ecbd1 1205-1206
+components/hub75/include/hub75_types.h
+  s_3607b8f5ca7a9a::t_8f8c9241563725 234-243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "abc446af88d06c1ea2c10835ef11ead5ec959a16",
+  "prompts": {},
+  "sessions": {
+    "s_3607b8f5ca7a9a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1dc84fe3-bc32-42e3-bb3d-9eab8113b28c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Thomas Lekanger <thomas.lekanger@hotmail.com>"
+    }
+  }
+}
