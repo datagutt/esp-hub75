@@ -100,6 +100,12 @@ bool Hub75Driver::begin() {
   dma_ = new PlatformDMAImpl(config_);
   if (!dma_ || !dma_->init()) {
     ESP_LOGE(TAG, "Failed to initialize DMA engine");
+    // Drop the half-built engine rather than leaving it reachable: running_ is
+    // still false, so end() would not clean it up, and every other method only
+    // checks dma_ for null before using it. Releasing it here also makes a
+    // retry after begin() failure (e.g. with a smaller bit depth) safe.
+    delete dma_;
+    dma_ = nullptr;
     return false;
   }
 
