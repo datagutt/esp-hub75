@@ -199,6 +199,7 @@ All standard frequencies (8/10/16/20/32 MHz) divide evenly from 160 MHz.
    - Formula: `num_rows × descriptors_per_row × 12`
    - Descriptors per row (8-bit, lsbMsbTransitionBit=1): 1+1+2+3+5+9+17+33 = 71
    - Example (32 rows): 32 × 71 × 12 = ~27 KB
+   - One chain serves both buffers in double buffer mode: `flip_buffer()` retargets every descriptor to the other buffer instead of keeping a second chain
 
 **Total Memory** (64×64 panel, 8-bit):
 - Framebuffer: 16 KB

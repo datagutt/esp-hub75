@@ -21,6 +21,7 @@
 #include <cassert>                        // NOLINT(readability-simplify-boolean-expr)
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 #include <esp_log.h>
 #include <esp_rom_gpio.h>
 #include <esp_rom_sys.h>
@@ -115,7 +116,7 @@ GdmaDma::GdmaDma(const Hub75Config &config)
       dma_buffers_{nullptr, nullptr},
       row_buffers_{nullptr, nullptr},
       buffer_in_psram_{false, false},
-      descriptors_{nullptr, nullptr},
+      descriptors_(nullptr),
       front_idx_(0),
       active_idx_(0),
 #if HUB75_EXTERNAL_FRAMEBUFFERS
@@ -521,7 +522,7 @@ bool GdmaDma::configure_dma_transfer() {
 }
 
 void GdmaDma::start_transfer() {
-  if (!dma_chan_ || !descriptors_[front_idx_]) {
+  if (!dma_chan_ || !descriptors_) {
     ESP_LOGE(TAG, "DMA channel or descriptors not initialized");
     return;
   }
@@ -535,7 +536,7 @@ void GdmaDma::start_transfer() {
   esp_rom_delay_us(10);
 
   // Start GDMA transfer from first descriptor in chain (front buffer)
-  gdma_start(dma_chan_, (intptr_t) &descriptors_[front_idx_][0]);
+  gdma_start(dma_chan_, (intptr_t) &descriptors_[0]);
 
   // Delay before starting LCD
   esp_rom_delay_us(100);
@@ -594,14 +595,13 @@ void GdmaDma::shutdown() {
     periph_module_disable(PERIPH_LCD_CAM_MODULE);
   }
 
+  if (descriptors_) {
+    heap_caps_free(descriptors_);
+    descriptors_ = nullptr;
+  }
+
   // Free all allocated resources (using array structure)
   for (int i = 0; i < 2; i++) {
-    // Free descriptor chains
-    if (descriptors_[i]) {
-      heap_caps_free(descriptors_[i]);
-      descriptors_[i] = nullptr;
-    }
-
     // Free raw DMA buffers (single allocation per buffer)
     if (dma_buffers_[i]) {
       heap_caps_free(dma_buffers_[i]);
@@ -1024,38 +1024,34 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
 
 void GdmaDma::flip_buffer() {
   // Single buffer mode: no-op (both indices point to buffer 0)
-  if (!row_buffers_[1] || !descriptors_[1]) {
+  if (!is_double_buffered() || !descriptors_) {
     return;
   }
 
   // Make everything drawn since the last flip visible to the DMA before it is displayed
   sync_dirty_rows(active_idx_);
 
-  // Seamless descriptor chain redirection (no stop/start!)
+  // Retarget the running chain to the buffer just drawn (no stop/start).
   //
-  // DMA is continuously traversing a circular descriptor chain (front buffer).
-  // To switch buffers without stopping DMA:
-  //   1. Redirect old front's last descriptor to new buffer's first descriptor
-  //   2. Restore new buffer's circularity (so it loops forever when active)
-  //   3. DMA seamlessly transitions at next frame boundary
+  // Both buffers share one layout, so every descriptor moves by the same offset. The rewrite
+  // runs in chain order and takes a few tens of microseconds for thousands of descriptors,
+  // while the DMA spends several microseconds on each one, so the CPU overtakes the DMA
+  // almost immediately: descriptors behind the DMA show the new frame from the next refresh,
+  // the ones ahead of it already in this refresh. At worst one refresh is split between the
+  // old and the new frame at the row the DMA was on. Flipping right after the frame callback
+  // (EOF on the last row by default) puts that split at the top, so in practice it vanishes.
   //
-  // Example: Switching from buffer A to buffer B:
-  //   Before: A_last → A_first (circular)
-  //   After:  A_last → B_first, B_last → B_first (A→B splice, B circular)
-  //   DMA finishes A, jumps to B, continues B forever
-  //
-  // No stop, no start, no visual glitch!
+  // The old front buffer becomes the draw buffer on return. The GDMA may still be reading the
+  // descriptor it had loaded (plus the one it prefetched), so the first writes can reach at
+  // most two bit plane transfers of the outgoing frame.
+  const uintptr_t delta = (uintptr_t) dma_buffers_[active_idx_] - (uintptr_t) dma_buffers_[front_idx_];
+  for (size_t i = 0; i < descriptor_count_; i++) {
+    descriptors_[i].buffer = (void *) ((uintptr_t) descriptors_[i].buffer + delta);
+  }
+  // Descriptor stores must land before the caller starts drawing into the old front buffer
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 
-  // Step 1: Redirect current front's last descriptor to new buffer's first descriptor
-  descriptors_[front_idx_][descriptor_count_ - 1].next = &descriptors_[active_idx_][0];
-
-  // Step 2: Restore new buffer's circularity (for when it becomes old front later)
-  descriptors_[active_idx_][descriptor_count_ - 1].next = &descriptors_[active_idx_][0];
-
-  // Step 3: Swap indices (after descriptor manipulation)
   std::swap(front_idx_, active_idx_);
-
-  // DMA seamlessly transitions at next frame boundary - no interruption!
 }
 
 // ============================================================================
@@ -1334,62 +1330,6 @@ void GdmaDma::set_brightness_oe() {
   ESP_LOGD(TAG, "Brightness OE configuration complete");
 }
 
-bool GdmaDma::build_descriptor_chain_internal(RowBitPlaneBuffer *buffers, dma_descriptor_t *descriptors) {
-  if (!buffers || !descriptors) {
-    return false;
-  }
-
-  size_t pixels_per_bitplane = dma_width_;              // DMA buffer width per bit plane
-  size_t bytes_per_bitplane = pixels_per_bitplane * 2;  // uint16_t = 2 bytes
-
-  // Link descriptors with BCM repetitions
-  size_t desc_idx = 0;
-  const int configured_sync_row = config_.frame_sync_row;
-  const int sync_row =
-      (configured_sync_row >= 0 && configured_sync_row < num_rows_)
-          ? configured_sync_row
-          : (num_rows_ - 1);
-  for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < bit_depth_; bit++) {
-      uint8_t *const bit_buffer = buffers[row].data + (bit * bytes_per_bitplane);
-
-      // Calculate number of descriptor repetitions for this bit plane
-      const int repetitions = (bit <= lsbMsbTransitionBit_) ? 1  // Base timing for LSBs
-                                                            : (1 << (bit - lsbMsbTransitionBit_ - 1));  // BCM weighting
-
-      // Create 'repetitions' descriptors, all pointing to the SAME buffer
-      // This achieves BCM timing via temporal repetition
-      for (int rep = 0; rep < repetitions; rep++) {
-        dma_descriptor_t *const desc = &descriptors[desc_idx];
-        desc->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
-        desc->dw0.suc_eof = 0;  // EOF only on last descriptor
-        desc->dw0.size = bytes_per_bitplane;
-        desc->dw0.length = bytes_per_bitplane;
-        desc->buffer = bit_buffer;  // Same buffer for all repetitions
-
-        // Link to next descriptor
-        if (desc_idx < descriptor_count_ - 1) {
-          desc->next = &descriptors[desc_idx + 1];
-        }
-
-        desc_idx++;
-      }
-    }
-
-    // Keep exactly one EOF per refresh. On a single-buffer display this may
-    // sit just after a latency-sensitive region, leaving the remaining rows
-    // as a safe window to update that region before the chain wraps.
-    if (row == sync_row) {
-      descriptors[desc_idx - 1].dw0.suc_eof = 1;
-    }
-  }
-
-  // Last descriptor loops back to first (continuous refresh)
-  descriptors[descriptor_count_ - 1].next = &descriptors[0];
-
-  return true;
-}
-
 bool GdmaDma::build_descriptor_chain() {
   // Calculate total descriptors needed WITH BCM repetitions
   // For bits <= lsbMsbTransitionBit: 1 descriptor each (base timing)
@@ -1417,51 +1357,71 @@ bool GdmaDma::build_descriptor_chain() {
   ESP_LOGI(TAG, "Building BCM descriptor chain: %zu descriptors (%zu per row) for %d rows × %d bits", descriptor_count_,
            descriptors_per_row, num_rows_, bit_depth_);
   ESP_LOGI(TAG, "  BCM via descriptor repetition (lsbMsbTransitionBit=%d)", lsbMsbTransitionBit_);
-  ESP_LOGI(TAG, "  Allocating %zu bytes per descriptor array", total_descriptor_bytes);
+  ESP_LOGI(TAG, "  Allocating %zu bytes for the descriptor chain", total_descriptor_bytes);
 
   // Free existing descriptors if already allocated (prevent leak on retry)
-  for (auto &descriptor : descriptors_) {
-    if (descriptor) {
-      heap_caps_free(descriptor);
-      descriptor = nullptr;
-    }
+  if (descriptors_) {
+    heap_caps_free(descriptors_);
+    descriptors_ = nullptr;
   }
 
-  // GDMA only fetches descriptors from internal RAM
-  constexpr uint32_t DESCRIPTOR_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
-
-  // Always allocate first descriptor chain (buffer 0)
-  // Use calloc to zero-initialize descriptor memory (prevents garbage in control bits)
-  descriptors_[0] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, DESCRIPTOR_CAPS);
-  if (!descriptors_[0]) {
-    ESP_LOGE(TAG, "Failed to allocate %zu descriptors [0] (%zu bytes) in DMA memory", descriptor_count_,
+  // GDMA only fetches descriptors from internal RAM. calloc keeps unused control bits zero.
+  descriptors_ = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  if (!descriptors_) {
+    ESP_LOGE(TAG, "Failed to allocate %zu descriptors (%zu bytes) in DMA memory", descriptor_count_,
              total_descriptor_bytes);
     return false;
   }
 
-  if (!build_descriptor_chain_internal(row_buffers_[0], descriptors_[0])) {
-    ESP_LOGE(TAG, "Failed to build descriptor chain [0]");
-    return false;
-  }
-  ESP_LOGI(TAG, "BCM descriptor chain [0] built: %zu descriptors in continuous loop", descriptor_count_);
+  // The chain starts on the front buffer; flip_buffer() retargets it to the other one
+  const RowBitPlaneBuffer *const buffers = row_buffers_[front_idx_];
+  const size_t bytes_per_bitplane = dma_width_ * sizeof(uint16_t);
 
-  // Conditionally allocate second descriptor chain (buffer 1)
-  if (is_double_buffered()) {
-    // Use calloc to zero-initialize descriptor memory (prevents garbage in control bits)
-    descriptors_[1] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, DESCRIPTOR_CAPS);
-    if (!descriptors_[1]) {
-      ESP_LOGE(TAG, "Failed to allocate %zu descriptors [1] (%zu bytes) in DMA memory", descriptor_count_,
-               total_descriptor_bytes);
-      return false;
+  // Link descriptors with BCM repetitions
+  size_t desc_idx = 0;
+  const int configured_sync_row = config_.frame_sync_row;
+  const int sync_row =
+      (configured_sync_row >= 0 && configured_sync_row < num_rows_) ? configured_sync_row : (num_rows_ - 1);
+  for (int row = 0; row < num_rows_; row++) {
+    for (int bit = 0; bit < bit_depth_; bit++) {
+      uint8_t *const bit_buffer = buffers[row].data + (bit * bytes_per_bitplane);
+
+      // Calculate number of descriptor repetitions for this bit plane
+      const int repetitions = (bit <= lsbMsbTransitionBit_) ? 1  // Base timing for LSBs
+                                                            : (1 << (bit - lsbMsbTransitionBit_ - 1));  // BCM weighting
+
+      // Create 'repetitions' descriptors, all pointing to the SAME buffer
+      // This achieves BCM timing via temporal repetition
+      for (int rep = 0; rep < repetitions; rep++) {
+        dma_descriptor_t *const desc = &descriptors_[desc_idx];
+        desc->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        desc->dw0.suc_eof = 0;  // EOF only on last descriptor
+        desc->dw0.size = bytes_per_bitplane;
+        desc->dw0.length = bytes_per_bitplane;
+        desc->buffer = bit_buffer;  // Same buffer for all repetitions
+
+        // Link to next descriptor
+        if (desc_idx < descriptor_count_ - 1) {
+          desc->next = &descriptors_[desc_idx + 1];
+        }
+
+        desc_idx++;
+      }
     }
 
-    if (!build_descriptor_chain_internal(row_buffers_[1], descriptors_[1])) {
-      ESP_LOGE(TAG, "Failed to build descriptor chain [1]");
-      return false;
+    // Keep exactly one EOF per refresh. On a single-buffer display this may
+    // sit just after a latency-sensitive region, leaving the remaining rows
+    // as a safe window to update that region before the chain wraps.
+    if (row == sync_row) {
+      descriptors_[desc_idx - 1].dw0.suc_eof = 1;
     }
-    ESP_LOGI(TAG, "BCM descriptor chain [1] built: %zu descriptors in continuous loop (double buffer mode)",
-             descriptor_count_);
   }
+
+  // Last descriptor loops back to first (continuous refresh)
+  descriptors_[descriptor_count_ - 1].next = &descriptors_[0];
+
+  ESP_LOGI(TAG, "BCM descriptor chain built: %zu descriptors in continuous loop%s", descriptor_count_,
+           is_double_buffered() ? " (shared by both buffers)" : "");
 
   return true;
 }

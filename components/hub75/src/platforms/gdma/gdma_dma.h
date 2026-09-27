@@ -137,8 +137,6 @@ class GdmaDma : public PlatformDma {
   void set_brightness_oe();                                                         // Set OE bits for BCM control
   void set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t brightness);  // Helper: set OE for one buffer
   bool build_descriptor_chain();
-  bool build_descriptor_chain_internal(RowBitPlaneBuffer *buffers,
-                                       dma_descriptor_t *descriptors);  // Helper: build one chain
 
   // BCM timing calculation (calculates lsbMsbTransitionBit for OE control)
   void calculate_bcm_timings();
@@ -196,7 +194,11 @@ class GdmaDma : public PlatformDma {
   uint8_t *dma_buffers_[2];            // Raw buffer allocations (single calloc per buffer)
   RowBitPlaneBuffer *row_buffers_[2];  // Metadata arrays pointing into dma_buffers_
   bool buffer_in_psram_[2];            // Allocation landed in PSRAM (needs cache write-back before DMA sees it)
-  dma_descriptor_t *descriptors_[2];   // Descriptor chains (one per buffer)
+
+  // One descriptor chain serves both buffers and always points at buffers[front_idx_].
+  // flip_buffer() retargets it instead of keeping a second chain, which would cost another
+  // descriptor_count_ * 12 bytes of internal RAM (GDMA cannot fetch descriptors from PSRAM).
+  dma_descriptor_t *descriptors_;
 
   int front_idx_;   // DMA displays buffers[front_idx_]
   int active_idx_;  // CPU draws to buffers[active_idx_]
@@ -207,7 +209,7 @@ class GdmaDma : public PlatformDma {
   uint16_t dirty_row_end_[2];
 #endif
 
-  size_t descriptor_count_;  // Number of descriptors per chain
+  size_t descriptor_count_;  // Number of descriptors in the chain
 
   // Brightness control (implementation of base class interface)
   uint8_t basis_brightness_;  // 1-255
