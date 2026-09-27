@@ -14,9 +14,11 @@
 #include "hub75_internal.h"  // For Hub75FramebufferFormat
 #include "../platform_dma.h"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <variant>
 #include <esp_private/gdma.h>
+#include <esp_timer.h>
 #include <hal/dma_types.h>
 
 namespace hub75 {
@@ -162,6 +164,18 @@ class GdmaDma : public PlatformDma {
   void limit_clock_for_psram();
   void verify_psram_writeback(int buffer_idx, esp_err_t sync_err);
   void log_dma_health();
+
+  // When PSRAM cannot feed the GDMA in time the transfer can halt and the scan freezes on one
+  // row. A periodic check restarts the transfer when the GDMA stops advancing. Only armed for
+  // PSRAM framebuffers.
+  void start_stall_watchdog();
+  void stop_stall_watchdog();
+  static void stall_watchdog_cb(void *arg);
+  void restart_transfer();
+  esp_timer_handle_t stall_timer_ = nullptr;
+  std::atomic<bool> transfer_running_{false};  // Watchdog may restart only while set
+  uint32_t stall_restarts_ = 0;
+  bool flip_sync_logged_ = false;
 
   size_t row_stride_bytes_;    // Bytes per row (all bit planes of one row)
   size_t total_buffer_bytes_;  // Allocated bytes per buffer (padded to the PSRAM alignment when in PSRAM)

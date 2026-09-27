@@ -554,9 +554,13 @@ void GdmaDma::start_transfer() {
 
   ESP_LOGI(TAG, "Descriptor-chain DMA transfer started - running continuously");
   log_dma_health();
+  transfer_running_ = true;
+  start_stall_watchdog();
 }
 
 void GdmaDma::stop_transfer() {
+  transfer_running_ = false;
+  stop_stall_watchdog();
   if (!dma_chan_) {
     return;
   }
@@ -1037,8 +1041,21 @@ void GdmaDma::flip_buffer() {
     return;
   }
 
-  // Make everything drawn since the last flip visible to the DMA before it is displayed
+  // Make the whole back buffer visible to the DMA before it is displayed. Writing back every
+  // row rather than only the tracked ones costs a fraction of a millisecond per flip (clean
+  // lines are skipped) and cannot miss a write.
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  mark_all_rows_dirty(active_idx_);
+  const int64_t sync_start_us = esp_timer_get_time();
+#endif
   sync_dirty_rows(active_idx_);
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  if (!flip_sync_logged_ && buffer_in_psram_[active_idx_]) {
+    flip_sync_logged_ = true;
+    ESP_LOGI(TAG, "First flip: PSRAM write-back of %zu bytes took %lld us", total_buffer_bytes_,
+             (long long) (esp_timer_get_time() - sync_start_us));
+  }
+#endif
 
   // Retarget the running chain to the buffer just drawn (no stop/start).
   //
@@ -1631,6 +1648,74 @@ void GdmaDma::log_dma_health() {
            healthy ? "OK" : "FAILED", actual_clock_hz_ / 1000000.0f, psram ? "PSRAM" : "internal RAM", lcd_running,
            (unsigned long) desc_a, (unsigned long) desc_b, desc_a != desc_b ? "moving" : "stuck", (unsigned long) raw,
            underrun, desc_error);
+}
+
+void GdmaDma::start_stall_watchdog() {
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  if (stall_timer_ || (!buffer_in_psram_[0] && !buffer_in_psram_[1])) {
+    return;
+  }
+  esp_timer_create_args_t args = {};
+  args.callback = &GdmaDma::stall_watchdog_cb;
+  args.arg = this;
+  args.dispatch_method = ESP_TIMER_TASK;
+  args.name = "hub75_stall";
+  if (esp_timer_create(&args, &stall_timer_) != ESP_OK) {
+    stall_timer_ = nullptr;
+    ESP_LOGW(TAG, "Could not create the DMA stall watchdog");
+    return;
+  }
+  esp_timer_start_periodic(stall_timer_, 100 * 1000);
+#endif
+}
+
+void GdmaDma::stop_stall_watchdog() {
+  if (stall_timer_) {
+    esp_timer_stop(stall_timer_);
+    esp_timer_delete(stall_timer_);
+    stall_timer_ = nullptr;
+  }
+}
+
+void GdmaDma::stall_watchdog_cb(void *arg) {
+  auto *self = static_cast<GdmaDma *>(arg);
+  int chan_id = 0;
+  if (!self->transfer_running_ || !self->dma_chan_ ||
+      gdma_get_group_channel_id(self->dma_chan_, nullptr, &chan_id) != ESP_OK) {
+    return;
+  }
+  // A running chain moves to a new descriptor every dma_width_ clocks; allow three of them
+  const uint32_t desc_time_us = (self->dma_width_ * 1000000u + self->actual_clock_hz_ - 1) / self->actual_clock_hz_;
+  const uint32_t desc_a = GDMA.channel[chan_id].out.dscr;
+  esp_rom_delay_us(3 * desc_time_us + 2);
+  const uint32_t desc_b = GDMA.channel[chan_id].out.dscr;
+  if (desc_a != desc_b || !self->transfer_running_) {
+    return;
+  }
+
+  const uint32_t raw = gdma_ll_tx_get_interrupt_status(&GDMA, chan_id, true);
+  const bool lcd_running = LCD_CAM.lcd_user.lcd_start;
+  self->stall_restarts_++;
+  // Rate limited: the first few, then every 100th
+  if (self->stall_restarts_ <= 5 || self->stall_restarts_ % 100 == 0) {
+    ESP_LOGW(TAG, "DMA stalled (PSRAM starvation?) at desc 0x%08lx, lcd_start=%d gdma_raw=0x%02lx; restart #%lu",
+             (unsigned long) desc_a, lcd_running, (unsigned long) raw, (unsigned long) self->stall_restarts_);
+  }
+  self->restart_transfer();
+}
+
+void GdmaDma::restart_transfer() {
+  LCD_CAM.lcd_user.lcd_start = 0;
+  LCD_CAM.lcd_user.lcd_update = 1;
+  gdma_stop(dma_chan_);
+  gdma_reset(dma_chan_);
+  LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+
+  LCD_CAM.lcd_user.lcd_update = 1;
+  esp_rom_delay_us(10);
+  gdma_start(dma_chan_, (intptr_t) &descriptors_[0]);
+  esp_rom_delay_us(100);
+  LCD_CAM.lcd_user.lcd_start = 1;
 }
 
 // ============================================================================
