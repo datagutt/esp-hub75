@@ -763,21 +763,36 @@ menu "HUB75 RGB LED Matrix Driver"
                 output clock if the panel flickers or shows corruption under
                 load, especially during flash writes (OTA, NVS, filesystem).
 
-        config HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ
-            int "Maximum output clock with PSRAM framebuffers (MHz)"
+        config HUB75_EXTERNAL_FRAMEBUFFERS_MAX_PSRAM_MBPS
+            int "PSRAM stream limit (MB/s)"
             depends on HUB75_EXTERNAL_FRAMEBUFFERS && IDF_TARGET_ESP32S3
-            range 8 32
+            range 4 64
             default 16
             help
-                Upper limit for the HUB75 output clock while a framebuffer
-                lives in PSRAM on ESP32-S3. A higher configured clock is
-                lowered to this value at init, with a warning.
+                Upper limit for the rate at which the display reads PSRAM on
+                ESP32-S3. The LCD reads output clock x 2 bytes per second with
+                no slack; when PSRAM cannot keep up (CPU traffic such as TLS
+                handshakes competes for it) the transfer halts and the scan
+                freezes. 32 MB/s from PSRAM alone was seen to stall under load.
 
-                The LCD peripheral reads 2 bytes per clock with no pause. If
-                PSRAM cannot keep up, the LCD FIFO underruns and the panel
-                goes blank or shows corruption. 32 MHz (64 MB/s) is more than
-                octal PSRAM at 80 MHz delivers next to CPU traffic; 16 MHz
-                needs 32 MB/s.
+                The most repeated (highest) bit planes are kept in internal
+                RAM until the PSRAM part of the stream fits this limit. Only
+                if HUB75_EXTERNAL_FRAMEBUFFERS_INTERNAL_PLANES is fixed and
+                still too low is the output clock lowered instead.
+
+        config HUB75_EXTERNAL_FRAMEBUFFERS_INTERNAL_PLANES
+            int "Bit planes kept in internal RAM (-1 = automatic)"
+            depends on HUB75_EXTERNAL_FRAMEBUFFERS && IDF_TARGET_ESP32S3
+            range -1 12
+            default -1
+            help
+                Number of most significant bit planes per buffer that stay in
+                internal RAM, the rest go to PSRAM. Each plane costs
+                width x 2 bytes x scan rows per buffer (8 KB for a 128x64
+                1/32 scan panel). -1 picks the fewest planes that keep the
+                PSRAM stream under HUB75_EXTERNAL_FRAMEBUFFERS_MAX_PSRAM_MBPS.
+                0 puts everything in PSRAM (the output clock is then lowered
+                to meet the limit).
 
     endmenu
 

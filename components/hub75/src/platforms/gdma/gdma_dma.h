@@ -118,10 +118,12 @@ class GdmaDma : public PlatformDma {
    */
   static constexpr int calculate_bcm_transmissions(int bit_depth, int lsb_msb_transition);
 
-  // Per-row buffer structure (holds all bit planes for one row)
+  // Bit planes of one row. Planes [0, split_plane_) are contiguous at `low`, planes
+  // [split_plane_, bit_depth_) contiguous at `high`. Without a split, `high` is simply where
+  // `low` ends, so a row is one contiguous [bit0][bit1]...[bitN] block.
   struct RowBitPlaneBuffer {
-    uint8_t *data;       // Contiguous buffer: [bit0 pixels][bit1 pixels]...[bitN pixels]
-    size_t buffer_size;  // Total size in bytes
+    uint8_t *low;
+    uint8_t *high;
   };
 
  private:
@@ -129,7 +131,27 @@ class GdmaDma : public PlatformDma {
   void configure_lcd_mode();
   void configure_gpio();
 
+  // Calls fn(bit, plane) for every bit plane of a row, in bit order
+  template<typename Fn>
+  __attribute__((always_inline)) inline void for_each_plane(const RowBitPlaneBuffer &row, Fn &&fn) const {
+    uint8_t *plane = row.low;
+    int bit = 0;
+    for (; bit < split_plane_; bit++, plane += plane_bytes_) {
+      fn(bit, reinterpret_cast<uint16_t *>(plane));
+    }
+    plane = row.high;
+    for (; bit < bit_depth_; bit++, plane += plane_bytes_) {
+      fn(bit, reinterpret_cast<uint16_t *>(plane));
+    }
+  }
+  uint16_t *plane_ptr(const RowBitPlaneBuffer &row, int bit) const {
+    return reinterpret_cast<uint16_t *>(bit < split_plane_ ? row.low + bit * plane_bytes_
+                                                           : row.high + (bit - split_plane_) * plane_bytes_);
+  }
+
   // Buffer management
+  void plan_psram_layout();
+  uint8_t transition_bit_for_clock(uint32_t clock_hz) const;
   bool allocate_row_buffers();
   uint8_t *allocate_framebuffer(size_t size, bool *in_psram);
   bool configure_dma_transfer();
@@ -161,7 +183,6 @@ class GdmaDma : public PlatformDma {
   void mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h);  // Identity transform only
   esp_err_t sync_dirty_rows(int buffer_idx);
 
-  void limit_clock_for_psram();
   void verify_psram_writeback(int buffer_idx, esp_err_t sync_err);
   void log_dma_health();
 
@@ -177,8 +198,11 @@ class GdmaDma : public PlatformDma {
   uint32_t stall_restarts_ = 0;
   bool flip_sync_logged_ = false;
 
-  size_t row_stride_bytes_;    // Bytes per row (all bit planes of one row)
-  size_t total_buffer_bytes_;  // Allocated bytes per buffer (padded to the PSRAM alignment when in PSRAM)
+  size_t plane_bytes_;         // Bytes per bit plane (dma_width_ 16-bit words)
+  uint8_t split_plane_;        // Planes below this live in dma_buffers_, the rest in hot_buffers_
+  size_t row_stride_bytes_;    // Bytes per row in dma_buffers_ (planes below split_plane_)
+  size_t total_buffer_bytes_;  // Bytes per dma_buffers_ allocation (padded to the PSRAM alignment when in PSRAM)
+  size_t hot_buffer_bytes_;    // Bytes per hot_buffers_ allocation (0 without a split)
 
   gdma_channel_handle_t dma_chan_;
   const uint8_t bit_depth_;      // Bit depth from config (6, 7, 8, 10, or 12)
@@ -209,7 +233,8 @@ class GdmaDma : public PlatformDma {
 
   // Double buffering: Array + index architecture
   // [0] = buffer A (always allocated), [1] = buffer B (nullptr if single-buffer mode)
-  uint8_t *dma_buffers_[2];            // Raw buffer allocations (single calloc per buffer)
+  uint8_t *dma_buffers_[2];            // Low bit planes (PSRAM with HUB75_EXTERNAL_FRAMEBUFFERS), or all of them
+  uint8_t *hot_buffers_[2];            // High (most repeated) bit planes in internal RAM, or nullptr
   RowBitPlaneBuffer *row_buffers_[2];  // Metadata arrays pointing into dma_buffers_
   bool buffer_in_psram_[2];            // Allocation landed in PSRAM (needs cache write-back before DMA sees it)
 

@@ -88,16 +88,22 @@ constexpr uint16_t OE_CLEAR_MASK = ~(1 << OE_BIT);
 // configurable) and the largest GDMA external memory block size.
 constexpr size_t PSRAM_FB_ALIGNMENT = 64;
 
-// Builds without this component's Kconfig (macro override) get the Kconfig default
-#ifndef CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ
-#define CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ 16
+// Builds without this component's Kconfig (macro override) get the Kconfig defaults
+#ifndef CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_PSRAM_MBPS
+#define CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_PSRAM_MBPS 16
+#endif
+#ifndef CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_INTERNAL_PLANES
+#define CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_INTERNAL_PLANES -1
 #endif
 #endif
 
 GdmaDma::GdmaDma(const Hub75Config &config)
     : PlatformDma(config),
+      plane_bytes_(0),
+      split_plane_(0),
       row_stride_bytes_(0),
       total_buffer_bytes_(0),
+      hot_buffer_bytes_(0),
       dma_chan_(nullptr),
       bit_depth_(resolve_bit_depth(config)),
       lsbMsbTransitionBit_(0),
@@ -119,6 +125,7 @@ GdmaDma::GdmaDma(const Hub75Config &config)
       // Use helper function to compute num_rows (halves for four-scan panels)
       num_rows_(get_effective_num_rows(config.scan_wiring, config.panel_height)),
       dma_buffers_{nullptr, nullptr},
+      hot_buffers_{nullptr, nullptr},
       row_buffers_{nullptr, nullptr},
       buffer_in_psram_{false, false},
       descriptors_(nullptr),
@@ -241,6 +248,12 @@ bool GdmaDma::init() {
   ESP_LOGI(TAG, "Clock: %.2f MHz (requested %u MHz)", actual_clock_hz_ / 1000000.0f,
            (unsigned int) (static_cast<uint32_t>(config_.output_clock_speed) / 1000000));
 
+  // Calculate BCM timing (determines lsbMsbTransitionBit for OE control)
+  calculate_bcm_timings();
+
+  // Decide which bit planes go to PSRAM (may lower the clock and redo the BCM timing)
+  plan_psram_layout();
+
   // Allocate per-row bit-plane buffers
   if (!allocate_row_buffers()) {
     return false;
@@ -250,12 +263,6 @@ bool GdmaDma::init() {
   if (!configure_dma_transfer()) {
     return false;
   }
-
-  // PSRAM bandwidth caps the output clock; BCM timing below depends on the final clock
-  limit_clock_for_psram();
-
-  // Calculate BCM timing (determines lsbMsbTransitionBit for OE control)
-  calculate_bcm_timings();
 
   // Adjust LUT for BCM monotonicity (only needed when lsbMsbTransitionBit > 0)
   // With transition=0, BCM weights are always monotonically non-decreasing
@@ -436,14 +443,16 @@ uint8_t *GdmaDma::allocate_framebuffer(size_t size, bool *in_psram) {
 }
 
 bool GdmaDma::allocate_row_buffers() {
-  const size_t bytes_per_bitplane = dma_width_ * sizeof(uint16_t);
+  plane_bytes_ = dma_width_ * sizeof(uint16_t);
   // Each bit plane is sent by one descriptor, whose length field is 12 bits wide
-  if (bytes_per_bitplane > DMA_DESCRIPTOR_BUFFER_MAX_SIZE) {
+  if (plane_bytes_ > DMA_DESCRIPTOR_BUFFER_MAX_SIZE) {
     ESP_LOGE(TAG, "DMA width %u exceeds the single-descriptor bit plane limit", dma_width_);
     return false;
   }
-  row_stride_bytes_ = bytes_per_bitplane * bit_depth_;
+  const size_t hot_row_stride = plane_bytes_ * (bit_depth_ - split_plane_);
+  row_stride_bytes_ = plane_bytes_ * split_plane_;
   total_buffer_bytes_ = num_rows_ * row_stride_bytes_;
+  hot_buffer_bytes_ = num_rows_ * hot_row_stride;
 #if HUB75_EXTERNAL_FRAMEBUFFERS
   // Pad so the last cache line written back belongs to this buffer
   total_buffer_bytes_ = (total_buffer_bytes_ + PSRAM_FB_ALIGNMENT - 1) & ~(PSRAM_FB_ALIGNMENT - 1);
@@ -452,9 +461,22 @@ bool GdmaDma::allocate_row_buffers() {
   const int buffer_count = config_.double_buffer ? 2 : 1;
   for (int i = 0; i < buffer_count; i++) {
     const char name = static_cast<char>('A' + i);
-    dma_buffers_[i] = allocate_framebuffer(total_buffer_bytes_, &buffer_in_psram_[i]);
-    if (!dma_buffers_[i]) {
-      ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer %c", total_buffer_bytes_, name);
+    bool ok = true;
+    if (total_buffer_bytes_ > 0) {
+      dma_buffers_[i] = allocate_framebuffer(total_buffer_bytes_, &buffer_in_psram_[i]);
+      ok = dma_buffers_[i] != nullptr;
+    }
+    if (ok && hot_buffer_bytes_ > 0) {
+      hot_buffers_[i] = (uint8_t *) heap_caps_calloc(1, hot_buffer_bytes_, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+      ok = hot_buffers_[i] != nullptr;
+    }
+    if (!ok) {
+      ESP_LOGE(TAG, "Failed to allocate buffer %c (%zu + %zu bytes)", name, total_buffer_bytes_, hot_buffer_bytes_);
+      heap_caps_free(dma_buffers_[i]);
+      heap_caps_free(hot_buffers_[i]);
+      dma_buffers_[i] = nullptr;
+      hot_buffers_[i] = nullptr;
+      buffer_in_psram_[i] = false;
       if (i == 0) {
         return false;
       }
@@ -462,15 +484,18 @@ bool GdmaDma::allocate_row_buffers() {
       break;
     }
 
-    // Point each row's metadata into the single allocation
     row_buffers_[i] = new RowBitPlaneBuffer[num_rows_];
     for (int row = 0; row < num_rows_; row++) {
-      row_buffers_[i][row].buffer_size = row_stride_bytes_;
-      row_buffers_[i][row].data = dma_buffers_[i] + row * row_stride_bytes_;
+      uint8_t *const low = dma_buffers_[i] ? dma_buffers_[i] + row * row_stride_bytes_ : nullptr;
+      row_buffers_[i][row].low = low;
+      row_buffers_[i][row].high = hot_buffers_[i] ? hot_buffers_[i] + row * hot_row_stride : low + row_stride_bytes_;
     }
 
-    ESP_LOGI(TAG, "Buffer %c allocated: %d rows × %zu bytes/row = %zu total (%s)", name, num_rows_, row_stride_bytes_,
-             total_buffer_bytes_, buffer_in_psram_[i] ? "PSRAM" : "internal RAM");
+    ESP_LOGI(TAG, "Buffer %c allocated: %d rows × %zu bytes/row = %zu total (%s)", name, num_rows_,
+             row_stride_bytes_ + hot_row_stride, num_rows_ * (row_stride_bytes_ + hot_row_stride),
+             hot_buffers_[i] ? (buffer_in_psram_[i] ? "low planes PSRAM, high planes internal RAM"
+                                                    : "low and high planes internal RAM")
+                             : (buffer_in_psram_[i] ? "PSRAM" : "internal RAM"));
   }
 
   // Single buffer: CPU and DMA share buffer 0. Double buffer: DMA shows 0, CPU draws into 1.
@@ -478,6 +503,85 @@ bool GdmaDma::allocate_row_buffers() {
   active_idx_ = is_double_buffered() ? 1 : 0;
 
   return true;
+}
+
+uint8_t GdmaDma::transition_bit_for_clock(uint32_t clock_hz) const {
+  // Smallest lsbMsbTransitionBit whose refresh rate meets min_refresh_rate (same search as
+  // calculate_bcm_timings())
+  const float buffer_time_us = (dma_width_ * 1000000.0f) / clock_hz;
+  for (uint8_t tb = 0; tb < bit_depth_; tb++) {
+    const float frame_us = calculate_bcm_transmissions(bit_depth_, tb) * buffer_time_us * num_rows_;
+    if ((int) (1000000.0f / frame_us) >= (int) config_.min_refresh_rate) {
+      return tb;
+    }
+  }
+  return bit_depth_ - 1;
+}
+
+// PSRAM layout: the LCD streams output clock x 2 bytes/s with no slack, and each bit plane is
+// read once per descriptor that repeats it. The high planes are read up to 2^(depth - tb - 2)
+// times per row, the low ones once, so keeping the few most repeated planes in internal RAM
+// removes most of the PSRAM traffic. PSRAM demand = clock x 2 x (reads of low planes / all
+// reads). Starvation halts the LCD (seen during TLS handshakes at 32 MB/s), hence the limit.
+void GdmaDma::plan_psram_layout() {
+  split_plane_ = bit_depth_;
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  if ((dma_width_ * sizeof(uint16_t)) % 16 != 0) {
+    return;  // allocate_framebuffer() keeps such buffers internal anyway
+  }
+  const uint64_t limit_bps = static_cast<uint64_t>(CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_PSRAM_MBPS) * 1000000;
+  const int forced_internal = CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_INTERNAL_PLANES;
+
+  auto reps = [](int bit, int tb) { return bit <= tb ? 1 : 1 << (bit - tb - 1); };
+  auto demand_bps = [&](uint32_t clock_hz, int tb, int split) {
+    int low_reads = 0;
+    for (int bit = 0; bit < split; bit++) {
+      low_reads += reps(bit, tb);
+    }
+    return static_cast<uint64_t>(clock_hz) * 2 * low_reads / calculate_bcm_transmissions(bit_depth_, tb);
+  };
+
+  // Lowest clock considered when the forced plane count cannot meet the limit
+  constexpr uint32_t MIN_CLOCK_HZ = 8000000;
+  uint32_t clock_hz = actual_clock_hz_;
+  int tb = lsbMsbTransitionBit_;
+  int split = bit_depth_;
+  while (true) {
+    if (forced_internal >= 0) {
+      split = bit_depth_ - std::min<int>(forced_internal, bit_depth_);
+    } else {
+      // Fewest internal planes that meet the limit (all internal always does)
+      for (split = bit_depth_; split > 0 && demand_bps(clock_hz, tb, split) > limit_bps; split--) {
+      }
+    }
+    if (demand_bps(clock_hz, tb, split) <= limit_bps || clock_hz <= MIN_CLOCK_HZ) {
+      break;
+    }
+    const uint32_t divider = 160000000 / clock_hz + 1;
+    clock_hz = 160000000 / divider;
+    tb = transition_bit_for_clock(clock_hz);
+  }
+
+  split_plane_ = split;
+  const uint64_t demand = demand_bps(clock_hz, tb, split);
+  const size_t internal_bytes = static_cast<size_t>(bit_depth_ - split) * dma_width_ * sizeof(uint16_t) * num_rows_ *
+                                (config_.double_buffer ? 2 : 1);
+  ESP_LOGI(TAG,
+           "PSRAM layout: bit planes 0-%d in PSRAM, %d-%d in internal RAM (%zu bytes); PSRAM stream %.1f MB/s at "
+           "%.2f MHz (limit %d MB/s)",
+           split - 1, split, bit_depth_ - 1, internal_bytes, demand / 1000000.0f, clock_hz / 1000000.0f,
+           CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_PSRAM_MBPS);
+  if (demand > limit_bps) {
+    ESP_LOGW(TAG, "PSRAM stream still above the limit; raise HUB75_EXTERNAL_FRAMEBUFFERS_INTERNAL_PLANES");
+  }
+  if (clock_hz != actual_clock_hz_) {
+    ESP_LOGW(TAG, "Output clock lowered from %.2f MHz to %.2f MHz to limit the PSRAM stream",
+             actual_clock_hz_ / 1000000.0f, clock_hz / 1000000.0f);
+    actual_clock_hz_ = clock_hz;
+    configure_lcd_clock();
+    calculate_bcm_timings();
+  }
+#endif
 }
 
 bool GdmaDma::configure_dma_transfer() {
@@ -514,13 +618,16 @@ bool GdmaDma::configure_dma_transfer() {
   size_t int_align = 1, ext_align = 1;
   gdma_get_alignment_constraints(dma_chan_, &int_align, &ext_align);
   for (int i = 0; i < 2; i++) {
-    if (!dma_buffers_[i]) {
-      continue;
-    }
-    const size_t align = buffer_in_psram_[i] ? ext_align : int_align;
-    if (((uintptr_t) dma_buffers_[i] % align) != 0 || (bytes_per_bitplane % align) != 0) {
-      ESP_LOGE(TAG, "Buffer %c at %p does not meet the GDMA alignment of %zu bytes", 'A' + i, dma_buffers_[i], align);
-      return false;
+    const uint8_t *const bases[2] = {dma_buffers_[i], hot_buffers_[i]};
+    for (int b = 0; b < 2; b++) {
+      if (!bases[b]) {
+        continue;
+      }
+      const size_t align = (b == 0 && buffer_in_psram_[i]) ? ext_align : int_align;
+      if (((uintptr_t) bases[b] % align) != 0 || (bytes_per_bitplane % align) != 0) {
+        ESP_LOGE(TAG, "Buffer %c at %p does not meet the GDMA alignment of %zu bytes", 'A' + i, bases[b], align);
+        return false;
+      }
     }
   }
 #endif
@@ -615,10 +722,14 @@ void GdmaDma::shutdown() {
 
   // Free all allocated resources (using array structure)
   for (int i = 0; i < 2; i++) {
-    // Free raw DMA buffers (single allocation per buffer)
+    // Free raw DMA buffers
     if (dma_buffers_[i]) {
       heap_caps_free(dma_buffers_[i]);
       dma_buffers_[i] = nullptr;
+    }
+    if (hot_buffers_[i]) {
+      heap_caps_free(hot_buffers_[i]);
+      hot_buffers_[i] = nullptr;
     }
 
     // Free metadata arrays
@@ -712,9 +823,6 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
   // Check if we can use identity fast path (no coordinate transforms needed)
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
-  // Pre-compute bit plane stride (bytes between bit planes)
-  const size_t bit_plane_stride = dma_width_ * 2;
-
   // Fused row-pair path: when an identity blit spans the full panel height,
   // source pixels (px, py) and (px, py + num_rows_) land in the SAME DMA word
   // (upper and lower RGB bits), so both halves are merged with a single
@@ -730,7 +838,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
     bool pair_cache_valid = false;
 
     for (uint16_t row = 0; row < num_rows_; row++) {
-      uint8_t *base_ptr = target_buffers[row].data;
+      const RowBitPlaneBuffer &row_buf = target_buffers[row];
       for (uint16_t dx = 0; dx < w; dx++) {
         const uint16_t px = x + dx;
 
@@ -766,12 +874,8 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         upper_ptr += pixel_stride;
         lower_ptr += pixel_stride;
 
-        uint8_t *plane_ptr = base_ptr;
-        for (int bit = 0; bit < bit_depth_; bit++) {
-          uint16_t *buf = (uint16_t *) plane_ptr;
-          buf[px] = (buf[px] & (uint16_t) ~RGB_MASK) | pair_patterns[bit];
-          plane_ptr += bit_plane_stride;
-        }
+        for_each_plane(
+            row_buf, [&](int bit, uint16_t *buf) { buf[px] = (buf[px] & (uint16_t) ~RGB_MASK) | pair_patterns[bit]; });
       }
     }
     mark_all_rows_dirty(active_idx_);
@@ -792,7 +896,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
     // Hoist row/is_lower computation for identity transform (constant per row)
     uint16_t id_row = 0;
     bool id_is_lower = false;
-    uint8_t *id_base_ptr = nullptr;
+    const RowBitPlaneBuffer *id_row_buf = nullptr;
     uint16_t id_clear_mask = 0;
     const uint16_t *id_patterns = nullptr;
     if (identity_transform) {
@@ -803,14 +907,14 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         id_row = py - num_rows_;
         id_is_lower = true;
       }
-      id_base_ptr = target_buffers[id_row].data;
+      id_row_buf = &target_buffers[id_row];
       id_clear_mask = id_is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
     }
 
     for (uint16_t dx = 0; dx < w; dx++) {
       uint16_t px = x + dx;
       uint16_t row;
-      uint8_t *base_ptr;
+      const RowBitPlaneBuffer *row_buf;
       uint16_t clear_mask;
 
       HUB75_PROFILE_BEGIN();
@@ -818,7 +922,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       // Fast path: identity transform — row-level values already computed
       if (identity_transform) {
         row = id_row;
-        base_ptr = id_base_ptr;
+        row_buf = id_row_buf;
         clear_mask = id_clear_mask;
       } else {
         // Full coordinate transformation pipeline
@@ -827,7 +931,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
                                                 virtual_width_, virtual_height_, dma_width_, num_rows_);
         px = transformed.x;
         row = transformed.row;
-        base_ptr = target_buffers[row].data;
+        row_buf = &target_buffers[row];
         clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
         touched_row_begin = std::min(touched_row_begin, row);
         touched_row_end = std::max(touched_row_end, static_cast<uint16_t>(row + 1));
@@ -876,10 +980,7 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       id_patterns = (clear_mask == (uint16_t) ~RGB_LOWER_MASK) ? cached_lower_patterns_ : cached_upper_patterns_;
 
       // Apply cached patterns to all bit planes (branch-free inner loop)
-      for (int bit = 0; bit < bit_depth_; bit++) {
-        uint16_t *buf = (uint16_t *) (base_ptr + (bit * bit_plane_stride));
-        buf[px] = (buf[px] & clear_mask) | id_patterns[bit];
-      }
+      for_each_plane(*row_buf, [&](int bit, uint16_t *buf) { buf[px] = (buf[px] & clear_mask) | id_patterns[bit]; });
 
       HUB75_PROFILE_STAGE(PROFILE_BITPLANE);
       HUB75_PROFILE_PIXEL();
@@ -906,14 +1007,12 @@ void GdmaDma::clear() {
 
   // Clear RGB bits in all buffers (keep control bits)
   for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < bit_depth_; bit++) {
-      uint16_t *buf = (uint16_t *) (target_buffers[row].data + (bit * dma_width_ * 2));
-
+    for_each_plane(target_buffers[row], [&](int, uint16_t *buf) {
       for (uint16_t x = 0; x < dma_width_; x++) {
         // Clear RGB bits but preserve row address, LAT, OE
         buf[x] &= ~RGB_MASK;
       }
-    }
+    });
   }
   mark_all_rows_dirty(active_idx_);
   if (!is_double_buffered()) {
@@ -964,7 +1063,6 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
   }
 
   // Pre-compute values for inner loop
-  const size_t bit_plane_stride = dma_width_ * 2;
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
   // Rows touched by the transformed path, for the PSRAM cache write-back
@@ -976,7 +1074,7 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
 
     // Hoist row-level values for identity transform (constant per row)
     uint16_t id_row = 0;
-    uint8_t *id_base_ptr = nullptr;
+    const RowBitPlaneBuffer *id_row_buf = nullptr;
     uint16_t id_clear_mask = 0;
     const uint16_t *id_patterns = nullptr;
     if (identity_transform) {
@@ -988,20 +1086,20 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
         id_row = py - num_rows_;
         id_is_lower = true;
       }
-      id_base_ptr = target_buffers[id_row].data;
+      id_row_buf = &target_buffers[id_row];
       id_clear_mask = id_is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
       id_patterns = id_is_lower ? lower_patterns : upper_patterns;
     }
 
     for (uint16_t dx = 0; dx < w; dx++) {
       uint16_t px = x + dx;
-      uint8_t *base_ptr;
+      const RowBitPlaneBuffer *row_buf;
       uint16_t clear_mask;
       const uint16_t *patterns;
 
       // Fast path: identity transform — row-level values already computed
       if (identity_transform) {
-        base_ptr = id_base_ptr;
+        row_buf = id_row_buf;
         clear_mask = id_clear_mask;
         patterns = id_patterns;
       } else {
@@ -1010,7 +1108,7 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
                                                 scan_wiring_, panel_width_, panel_height_, layout_rows_, layout_cols_,
                                                 virtual_width_, virtual_height_, dma_width_, num_rows_);
         px = transformed.x;
-        base_ptr = target_buffers[transformed.row].data;
+        row_buf = &target_buffers[transformed.row];
         clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
         patterns = transformed.is_lower ? lower_patterns : upper_patterns;
         touched_row_begin = std::min(touched_row_begin, static_cast<uint16_t>(transformed.row));
@@ -1018,10 +1116,7 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
       }
 
       // Update all bit planes (branch-free inner loop)
-      for (int bit = 0; bit < bit_depth_; bit++) {
-        uint16_t *buf = (uint16_t *) (base_ptr + (bit * bit_plane_stride));
-        buf[px] = (buf[px] & clear_mask) | patterns[bit];
-      }
+      for_each_plane(*row_buf, [&](int bit, uint16_t *buf) { buf[px] = (buf[px] & clear_mask) | patterns[bit]; });
     }
   }
   // Marked after the writes, so a concurrent full write-back cannot drop them
@@ -1059,7 +1154,8 @@ void GdmaDma::flip_buffer() {
 
   // Retarget the running chain to the buffer just drawn (no stop/start).
   //
-  // Both buffers share one layout, so every descriptor moves by the same offset. The rewrite
+  // Both buffers share one layout, so every descriptor moves by the offset between the two
+  // low-plane allocations or the two high-plane allocations, whichever it points into. The rewrite
   // runs in chain order and takes a few tens of microseconds for thousands of descriptors,
   // while the DMA spends several microseconds on each one, so the CPU overtakes the DMA
   // almost immediately: descriptors behind the DMA show the new frame from the next refresh,
@@ -1070,9 +1166,13 @@ void GdmaDma::flip_buffer() {
   // The old front buffer becomes the draw buffer on return. The GDMA may still be reading the
   // descriptor it had loaded (plus the one it prefetched), so the first writes can reach at
   // most two bit plane transfers of the outgoing frame.
-  const uintptr_t delta = (uintptr_t) dma_buffers_[active_idx_] - (uintptr_t) dma_buffers_[front_idx_];
+  const uintptr_t low_front = (uintptr_t) dma_buffers_[front_idx_];
+  const uintptr_t low_delta = (uintptr_t) dma_buffers_[active_idx_] - low_front;
+  const uintptr_t high_delta = (uintptr_t) hot_buffers_[active_idx_] - (uintptr_t) hot_buffers_[front_idx_];
   for (size_t i = 0; i < descriptor_count_; i++) {
-    descriptors_[i].buffer = (void *) ((uintptr_t) descriptors_[i].buffer + delta);
+    const uintptr_t addr = (uintptr_t) descriptors_[i].buffer;
+    const uintptr_t delta = (addr - low_front < total_buffer_bytes_) ? low_delta : high_delta;
+    descriptors_[i].buffer = (void *) (addr + delta);
   }
   // Descriptor stores must land before the caller starts drawing into the old front buffer
   std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1131,7 +1231,7 @@ void GdmaDma::initialize_buffer_internal(RowBitPlaneBuffer *buffers) {
     uint16_t row_addr = row & ADDR_MASK;
 
     for (int bit = 0; bit < bit_depth_; bit++) {
-      uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
+      uint16_t *buf = plane_ptr(buffers[row], bit);
 
       // Row address handling: LSB bit plane uses previous row for LAT settling
       //
@@ -1237,7 +1337,7 @@ void GdmaDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t bri
   if (brightness == 0) {
     for (int row = 0; row < num_rows_; row++) {
       for (int bit = 0; bit < bit_depth_; bit++) {
-        uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
+        uint16_t *buf = plane_ptr(buffers[row], bit);
         for (int x = 0; x < dma_width_; x++) {
           buf[x] |= (1 << OE_BIT);
         }
@@ -1258,7 +1358,7 @@ void GdmaDma::set_brightness_oe_internal(RowBitPlaneBuffer *buffers, uint8_t bri
 
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
-      uint16_t *buf = (uint16_t *) (buffers[row].data + (bit * dma_width_ * 2));
+      uint16_t *buf = plane_ptr(buffers[row], bit);
 
       // Uniform OE duty cycle: same display_pixels count for all bit planes.
       // BCM ratios come from descriptor repetition, not OE timing.
@@ -1410,7 +1510,7 @@ bool GdmaDma::build_descriptor_chain() {
       (configured_sync_row >= 0 && configured_sync_row < num_rows_) ? configured_sync_row : (num_rows_ - 1);
   for (int row = 0; row < num_rows_; row++) {
     for (int bit = 0; bit < bit_depth_; bit++) {
-      uint8_t *const bit_buffer = buffers[row].data + (bit * bytes_per_bitplane);
+      uint8_t *const bit_buffer = reinterpret_cast<uint8_t *>(plane_ptr(buffers[row], bit));
 
       // Calculate number of descriptor repetitions for this bit plane
       const int repetitions = (bit <= lsbMsbTransitionBit_) ? 1  // Base timing for LSBs
@@ -1575,35 +1675,15 @@ esp_err_t GdmaDma::sync_dirty_rows(int buffer_idx) {
 #endif
 }
 
-void GdmaDma::limit_clock_for_psram() {
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-  if (!buffer_in_psram_[0] && !buffer_in_psram_[1]) {
-    return;
-  }
-  const uint32_t max_hz = static_cast<uint32_t>(CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ) * 1000000;
-  if (actual_clock_hz_ <= max_hz) {
-    return;
-  }
-  // Largest 160 MHz / N clock that does not exceed the limit
-  const uint32_t divider = (160000000 + max_hz - 1) / max_hz;
-  const uint32_t limited_hz = 160000000 / divider;
-  ESP_LOGW(TAG, "PSRAM framebuffers: output clock lowered from %.2f MHz to %.2f MHz (%u MB/s from PSRAM)",
-           actual_clock_hz_ / 1000000.0f, limited_hz / 1000000.0f, (unsigned) (limited_hz * 2 / 1000000));
-  actual_clock_hz_ = limited_hz;
-  configure_lcd_clock();
-#endif
-}
-
 void GdmaDma::verify_psram_writeback(int buffer_idx, esp_err_t sync_err) {
 #if HUB75_EXTERNAL_FRAMEBUFFERS && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
-  if (!buffer_in_psram_[buffer_idx]) {
+  if (!buffer_in_psram_[buffer_idx] || split_plane_ == 0) {
     return;
   }
   // Drop the (clean, just written back) cache lines of row 0 bit plane 0 and read them again,
   // so the values below come from PSRAM, which is what the GDMA sees.
   uint16_t *const plane = reinterpret_cast<uint16_t *>(dma_buffers_[buffer_idx]);
-  const size_t plane_bytes = dma_width_ * sizeof(uint16_t);
-  const esp_err_t inv_err = esp_cache_msync(plane, plane_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+  const esp_err_t inv_err = esp_cache_msync(plane, plane_bytes_, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
 
   // Row 0, bit plane 0 carries the previous (last) row address, OE high, LAT on the last pixel
   const uint16_t addr_bits = ((num_rows_ - 1) & ADDR_MASK) << ADDR_SHIFT;
