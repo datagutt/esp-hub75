@@ -87,6 +87,11 @@ constexpr uint16_t OE_CLEAR_MASK = ~(1 << OE_BIT);
 // neighbouring allocation. 64 bytes is the largest ESP32-S3 data cache line (16/32/64 are
 // configurable) and the largest GDMA external memory block size.
 constexpr size_t PSRAM_FB_ALIGNMENT = 64;
+
+// Builds without this component's Kconfig (macro override) get the Kconfig default
+#ifndef CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ
+#define CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ 16
+#endif
 #endif
 
 GdmaDma::GdmaDma(const Hub75Config &config)
@@ -236,6 +241,19 @@ bool GdmaDma::init() {
   ESP_LOGI(TAG, "Clock: %.2f MHz (requested %u MHz)", actual_clock_hz_ / 1000000.0f,
            (unsigned int) (static_cast<uint32_t>(config_.output_clock_speed) / 1000000));
 
+  // Allocate per-row bit-plane buffers
+  if (!allocate_row_buffers()) {
+    return false;
+  }
+
+  // Burst and external memory access depend on where the buffers ended up
+  if (!configure_dma_transfer()) {
+    return false;
+  }
+
+  // PSRAM bandwidth caps the output clock; BCM timing below depends on the final clock
+  limit_clock_for_psram();
+
   // Calculate BCM timing (determines lsbMsbTransitionBit for OE control)
   calculate_bcm_timings();
 
@@ -251,16 +269,6 @@ bool GdmaDma::init() {
 
   // Validate brightness OE configuration safety margins
   if (!validate_brightness_config()) {
-    return false;
-  }
-
-  // Allocate per-row bit-plane buffers
-  if (!allocate_row_buffers()) {
-    return false;
-  }
-
-  // Burst and external memory access depend on where the buffers ended up
-  if (!configure_dma_transfer()) {
     return false;
   }
 
@@ -545,6 +553,7 @@ void GdmaDma::start_transfer() {
   LCD_CAM.lcd_user.lcd_start = 1;
 
   ESP_LOGI(TAG, "Descriptor-chain DMA transfer started - running continuously");
+  log_dma_health();
 }
 
 void GdmaDma::stop_transfer() {
@@ -1161,7 +1170,7 @@ void GdmaDma::initialize_blank_buffers() {
     if (row_buffers_[i]) {
       initialize_buffer_internal(row_buffers_[i]);
       mark_all_rows_dirty(i);
-      sync_dirty_rows(i);
+      verify_psram_writeback(i, sync_dirty_rows(i));
     }
   }
   ESP_LOGI(TAG, "Blank buffers initialized");
@@ -1514,14 +1523,14 @@ void GdmaDma::mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h) {
   }
 }
 
-void GdmaDma::sync_dirty_rows(int buffer_idx) {
+esp_err_t GdmaDma::sync_dirty_rows(int buffer_idx) {
 #if HUB75_EXTERNAL_FRAMEBUFFERS
   const uint16_t begin = dirty_row_begin_[buffer_idx];
   const uint16_t end = dirty_row_end_[buffer_idx];
   dirty_row_begin_[buffer_idx] = UINT16_MAX;
   dirty_row_end_[buffer_idx] = 0;
   if (!buffer_in_psram_[buffer_idx] || begin >= end) {
-    return;
+    return ESP_OK;
   }
 
   // Widen the row range to whole cache lines. The allocation is aligned and padded to
@@ -1543,7 +1552,85 @@ void GdmaDma::sync_dirty_rows(int buffer_idx) {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "PSRAM cache write-back failed: %s", esp_err_to_name(err));
   }
+  return err;
+#else
+  return ESP_OK;
 #endif
+}
+
+void GdmaDma::limit_clock_for_psram() {
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  if (!buffer_in_psram_[0] && !buffer_in_psram_[1]) {
+    return;
+  }
+  const uint32_t max_hz = static_cast<uint32_t>(CONFIG_HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ) * 1000000;
+  if (actual_clock_hz_ <= max_hz) {
+    return;
+  }
+  // Largest 160 MHz / N clock that does not exceed the limit
+  const uint32_t divider = (160000000 + max_hz - 1) / max_hz;
+  const uint32_t limited_hz = 160000000 / divider;
+  ESP_LOGW(TAG, "PSRAM framebuffers: output clock lowered from %.2f MHz to %.2f MHz (%u MB/s from PSRAM)",
+           actual_clock_hz_ / 1000000.0f, limited_hz / 1000000.0f, (unsigned) (limited_hz * 2 / 1000000));
+  actual_clock_hz_ = limited_hz;
+  configure_lcd_clock();
+#endif
+}
+
+void GdmaDma::verify_psram_writeback(int buffer_idx, esp_err_t sync_err) {
+#if HUB75_EXTERNAL_FRAMEBUFFERS && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+  if (!buffer_in_psram_[buffer_idx]) {
+    return;
+  }
+  // Drop the (clean, just written back) cache lines of row 0 bit plane 0 and read them again,
+  // so the values below come from PSRAM, which is what the GDMA sees.
+  uint16_t *const plane = reinterpret_cast<uint16_t *>(dma_buffers_[buffer_idx]);
+  const size_t plane_bytes = dma_width_ * sizeof(uint16_t);
+  const esp_err_t inv_err = esp_cache_msync(plane, plane_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+
+  // Row 0, bit plane 0 carries the previous (last) row address, OE high, LAT on the last pixel
+  const uint16_t addr_bits = ((num_rows_ - 1) & ADDR_MASK) << ADDR_SHIFT;
+  const uint16_t expect_first = addr_bits | (1 << OE_BIT);
+  const uint16_t expect_last = expect_first | (1 << LAT_BIT);
+  const uint16_t first = plane[0];
+  const uint16_t last = plane[dma_width_ - 1];
+  const bool ok = sync_err == ESP_OK && inv_err == ESP_OK && first == expect_first && last == expect_last;
+  ESP_LOGI(TAG,
+           "Buffer %c PSRAM write-back check %s: msync=%s invalidate=%s first=0x%04x/0x%04x last=0x%04x/0x%04x (%p)",
+           'A' + buffer_idx, ok ? "OK" : "FAILED", esp_err_to_name(sync_err), esp_err_to_name(inv_err), first,
+           expect_first, last, expect_last, plane);
+#endif
+}
+
+void GdmaDma::log_dma_health() {
+  // One-time check shortly after start: the LCD must still be running, the GDMA must be walking
+  // the chain, and its TX FIFO must not have underrun (PSRAM starvation).
+  int chan_id = 0;
+  if (gdma_get_group_channel_id(dma_chan_, nullptr, &chan_id) != ESP_OK) {
+    return;
+  }
+  esp_rom_delay_us(2000);
+  const uint32_t desc_a = GDMA.channel[chan_id].out.dscr;
+  esp_rom_delay_us(1000);
+  const uint32_t desc_b = GDMA.channel[chan_id].out.dscr;
+  const uint32_t raw = gdma_ll_tx_get_interrupt_status(&GDMA, chan_id, true);
+  const bool lcd_running = LCD_CAM.lcd_user.lcd_start;
+  const bool underrun = raw & (GDMA_LL_EVENT_TX_L1_FIFO_UDF | GDMA_LL_EVENT_TX_L3_FIFO_UDF);
+  const bool desc_error = raw & GDMA_LL_EVENT_TX_DESC_ERROR;
+  const bool healthy = lcd_running && desc_a != desc_b && !underrun && !desc_error;
+  const bool psram = buffer_in_psram_[0] || buffer_in_psram_[1];
+
+  if (healthy && !psram) {
+    ESP_LOGD(TAG, "DMA health OK: lcd running, desc 0x%08lx -> 0x%08lx", (unsigned long) desc_a,
+             (unsigned long) desc_b);
+    return;
+  }
+  ESP_LOGI(TAG,
+           "DMA health %s @ %.2f MHz (%s): lcd_start=%d desc 0x%08lx -> 0x%08lx (%s) gdma_raw=0x%02lx "
+           "fifo_underrun=%d desc_error=%d",
+           healthy ? "OK" : "FAILED", actual_clock_hz_ / 1000000.0f, psram ? "PSRAM" : "internal RAM", lcd_running,
+           (unsigned long) desc_a, (unsigned long) desc_b, desc_a != desc_b ? "moving" : "stuck", (unsigned long) raw,
+           underrun, desc_error);
 }
 
 // ============================================================================

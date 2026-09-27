@@ -44,6 +44,7 @@ Or: **HUB75 Display Configuration** (panel/pin configuration)
 - **Description**: Allocates the DMA framebuffers in PSRAM. DMA descriptors stay in internal RAM. If a PSRAM allocation fails, that buffer falls back to internal RAM with a warning.
 - **Memory impact (ESP32-S3)**: Frees the framebuffers from internal RAM, for example 64 KB per buffer for a 128×64 panel at 8 bit depth (128 KB with double buffering)
 - **Bandwidth**: The panel streams continuously from PSRAM at output clock × 2 bytes per second (64 MB/s at 32 MHz), shared with the CPU cache, other DMA users and flash writes on the same SPI bus. Use octal PSRAM at 80 MHz or faster on ESP32-S3, and lower `HUB75_CLOCK_SPEED` if the panel flickers or shows corruption under load or during flash writes (OTA, NVS, filesystems).
+- **Clock limit (ESP32-S3)**: `HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ` (default 16) caps the output clock while a framebuffer is in PSRAM. A higher configured clock is lowered at init with a warning, because an LCD FIFO underrun leaves the panel blank or corrupted.
 - **Cache**: CPU writes go through the data cache. The driver writes dirty rows back to PSRAM once per draw call in single buffer mode and once per `flip_buffer()` in double buffer mode.
 
 ### HUB75_DEBUG_TIMING

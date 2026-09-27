@@ -157,15 +157,19 @@ class GdmaDma : public PlatformDma {
   }
   void mark_all_rows_dirty(int buffer_idx) { mark_rows_dirty(buffer_idx, 0, num_rows_); }
   void mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h);  // Identity transform only
-  void sync_dirty_rows(int buffer_idx);
+  esp_err_t sync_dirty_rows(int buffer_idx);
+
+  void limit_clock_for_psram();
+  void verify_psram_writeback(int buffer_idx, esp_err_t sync_err);
+  void log_dma_health();
 
   size_t row_stride_bytes_;    // Bytes per row (all bit planes of one row)
   size_t total_buffer_bytes_;  // Allocated bytes per buffer (padded to the PSRAM alignment when in PSRAM)
 
   gdma_channel_handle_t dma_chan_;
-  const uint8_t bit_depth_;         // Bit depth from config (6, 7, 8, 10, or 12)
-  uint8_t lsbMsbTransitionBit_;     // BCM optimization threshold (calculated at init)
-  const uint32_t actual_clock_hz_;  // Actual achieved clock frequency after rounding
+  const uint8_t bit_depth_;      // Bit depth from config (6, 7, 8, 10, or 12)
+  uint8_t lsbMsbTransitionBit_;  // BCM optimization threshold (calculated at init)
+  uint32_t actual_clock_hz_;     // Achieved clock after rounding (lowered for PSRAM framebuffers)
 
   // Panel configuration (immutable, cached from config)
   const uint16_t panel_width_;

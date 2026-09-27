@@ -763,6 +763,22 @@ menu "HUB75 RGB LED Matrix Driver"
                 output clock if the panel flickers or shows corruption under
                 load, especially during flash writes (OTA, NVS, filesystem).
 
+        config HUB75_EXTERNAL_FRAMEBUFFERS_MAX_CLOCK_MHZ
+            int "Maximum output clock with PSRAM framebuffers (MHz)"
+            depends on HUB75_EXTERNAL_FRAMEBUFFERS && IDF_TARGET_ESP32S3
+            range 8 32
+            default 16
+            help
+                Upper limit for the HUB75 output clock while a framebuffer
+                lives in PSRAM on ESP32-S3. A higher configured clock is
+                lowered to this value at init, with a warning.
+
+                The LCD peripheral reads 2 bytes per clock with no pause. If
+                PSRAM cannot keep up, the LCD FIFO underruns and the panel
+                goes blank or shows corruption. 32 MHz (64 MB/s) is more than
+                octal PSRAM at 80 MHz delivers next to CPU traffic; 16 MHz
+                needs 32 MB/s.
+
     endmenu
 
     # ========================================
