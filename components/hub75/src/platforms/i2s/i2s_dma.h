@@ -68,8 +68,8 @@ class I2sDma : public PlatformDma {
   /**
    * @brief Resolve clock speed to achievable frequency (I2S constraints)
    *
-   * ESP32: max 10 MHz (80 MHz / 2 / 4)
-   * ESP32-S2: max 20 MHz (160 MHz / 2 / 4)
+   * ESP32 and ESP32-S2: max 20 MHz (160 MHz / 2 / 4), integer dividers only,
+   * so requests round to 20, 13.33, 10, 8 MHz, ...
    */
   HUB75_CONST uint32_t resolve_actual_clock_speed(Hub75ClockSpeed clock_speed) const;
 
