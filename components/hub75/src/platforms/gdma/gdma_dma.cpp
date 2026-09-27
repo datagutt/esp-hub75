@@ -37,13 +37,17 @@
 // Header location changed in ESP-IDF 5.0
 #if (ESP_IDF_VERSION_MAJOR >= 5)
 #include <esp_private/periph_ctrl.h>
-#include <esp_memory_utils.h>
-#include <esp_cache.h>
 #else
-#include "rom/cache.h"
 #include <driver/periph_ctrl.h>
 #endif
 #include <esp_heap_caps.h>
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+#include <esp_cache.h>
+#else
+#include <rom/cache.h>
+#endif
+#endif
 
 static const char *const TAG = "GdmaDma";
 
@@ -77,8 +81,17 @@ constexpr uint16_t RGB_MASK = RGB_UPPER_MASK | RGB_LOWER_MASK;  // 0x003F
 // Bit clear masks
 constexpr uint16_t OE_CLEAR_MASK = ~(1 << OE_BIT);
 
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+// PSRAM framebuffers start and end on this boundary so that cache write-backs never touch a
+// neighbouring allocation. 64 bytes is the largest ESP32-S3 data cache line (16/32/64 are
+// configurable) and the largest GDMA external memory block size.
+constexpr size_t PSRAM_FB_ALIGNMENT = 64;
+#endif
+
 GdmaDma::GdmaDma(const Hub75Config &config)
     : PlatformDma(config),
+      row_stride_bytes_(0),
+      total_buffer_bytes_(0),
       dma_chan_(nullptr),
       bit_depth_(resolve_bit_depth(config)),
       lsbMsbTransitionBit_(0),
@@ -101,9 +114,14 @@ GdmaDma::GdmaDma(const Hub75Config &config)
       num_rows_(get_effective_num_rows(config.scan_wiring, config.panel_height)),
       dma_buffers_{nullptr, nullptr},
       row_buffers_{nullptr, nullptr},
+      buffer_in_psram_{false, false},
       descriptors_{nullptr, nullptr},
       front_idx_(0),
       active_idx_(0),
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+      dirty_row_begin_{UINT16_MAX, UINT16_MAX},
+      dirty_row_end_{0, 0},
+#endif
       descriptor_count_(0),
       basis_brightness_(config.brightness),  // Use config value (default: 128)
       intensity_(1.0f) {
@@ -186,21 +204,6 @@ bool GdmaDma::init() {
 
   ESP_LOGI(TAG, "GDMA strategy configured: owner_check=false, auto_update_desc=false");
 
-  // Configure GDMA transfer for SRAM (not PSRAM)
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
-  gdma_transfer_config_t transfer_config = {
-      .max_data_burst_size = 32,  // 32 bytes for SRAM
-      .access_ext_mem = false     // Not accessing external memory
-  };
-  gdma_config_transfer(dma_chan_, &transfer_config);
-#else
-  gdma_transfer_ability_t ability = {
-      .sram_trans_align = 32,
-      .psram_trans_align = 64,
-  };
-  gdma_set_transfer_ability(dma_chan_, &ability);
-#endif
-
   // Wait for any pending LCD operations
   while (LCD_CAM.lcd_user.lcd_start)
     ;
@@ -252,6 +255,11 @@ bool GdmaDma::init() {
 
   // Allocate per-row bit-plane buffers
   if (!allocate_row_buffers()) {
+    return false;
+  }
+
+  // Burst and external memory access depend on where the buffers ended up
+  if (!configure_dma_transfer()) {
     return false;
   }
 
@@ -392,74 +400,123 @@ void GdmaDma::configure_gpio() {
   ESP_LOGD(TAG, "GPIO routing configured");
 }
 
-bool GdmaDma::allocate_row_buffers() {
-  size_t pixels_per_bitplane = dma_width_;  // DMA buffer width (all panels chained horizontally)
-  size_t buffer_size_per_row = pixels_per_bitplane * bit_depth_ * 2;  // uint16_t = 2 bytes
-  size_t total_buffer_size = num_rows_ * buffer_size_per_row;
-  total_buffer_bytes_ = total_buffer_size;
-
-#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
-  static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM;
-  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (PSRAM)", total_buffer_size, num_rows_);
+uint8_t *GdmaDma::allocate_framebuffer(size_t size, bool *in_psram) {
+  *in_psram = false;
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  // Each bit plane is one descriptor, and its size must be a whole number of 16-byte blocks
+  // (the smallest GDMA external memory block).
+  if ((dma_width_ * sizeof(uint16_t)) % 16 != 0) {
+    ESP_LOGW(TAG, "DMA width %u is not a multiple of 8 pixels, PSRAM framebuffers unavailable", dma_width_);
+  } else {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    // The heap maps DMA | SPIRAM to PSRAM and adds any cache line or flash encryption alignment
+    constexpr uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM;
 #else
-  static constexpr uint32_t DMA_MEM_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
-  ESP_LOGI(TAG, "Allocating buffer A: %zu bytes for %d rows (internal RAM)", total_buffer_size, num_rows_);
+    // Older heaps have no PSRAM region tagged DMA-capable
+    constexpr uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+#endif
+    auto *buf = (uint8_t *) heap_caps_aligned_calloc(PSRAM_FB_ALIGNMENT, 1, size, caps);
+    if (buf) {
+      *in_psram = true;
+      return buf;
+    }
+    ESP_LOGW(TAG, "PSRAM allocation of %zu bytes failed, falling back to internal RAM", size);
+  }
+#endif
+  return (uint8_t *) heap_caps_calloc(1, size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+}
+
+bool GdmaDma::allocate_row_buffers() {
+  const size_t bytes_per_bitplane = dma_width_ * sizeof(uint16_t);
+  // Each bit plane is sent by one descriptor, whose length field is 12 bits wide
+  if (bytes_per_bitplane > DMA_DESCRIPTOR_BUFFER_MAX_SIZE) {
+    ESP_LOGE(TAG, "DMA width %u exceeds the single-descriptor bit plane limit", dma_width_);
+    return false;
+  }
+  row_stride_bytes_ = bytes_per_bitplane * bit_depth_;
+  total_buffer_bytes_ = num_rows_ * row_stride_bytes_;
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  // Pad so the last cache line written back belongs to this buffer
+  total_buffer_bytes_ = (total_buffer_bytes_ + PSRAM_FB_ALIGNMENT - 1) & ~(PSRAM_FB_ALIGNMENT - 1);
 #endif
 
-  // Always allocate first buffer (buffer A, index 0)
-  dma_buffers_[0] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, DMA_MEM_CAPS);
-  if (!dma_buffers_[0]) {
-    ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer A", total_buffer_size);
+  const int buffer_count = config_.double_buffer ? 2 : 1;
+  for (int i = 0; i < buffer_count; i++) {
+    const char name = static_cast<char>('A' + i);
+    dma_buffers_[i] = allocate_framebuffer(total_buffer_bytes_, &buffer_in_psram_[i]);
+    if (!dma_buffers_[i]) {
+      ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer %c", total_buffer_bytes_, name);
+      if (i == 0) {
+        return false;
+      }
+      ESP_LOGW(TAG, "Continuing in single-buffer mode");
+      break;
+    }
+
+    // Point each row's metadata into the single allocation
+    row_buffers_[i] = new RowBitPlaneBuffer[num_rows_];
+    for (int row = 0; row < num_rows_; row++) {
+      row_buffers_[i][row].buffer_size = row_stride_bytes_;
+      row_buffers_[i][row].data = dma_buffers_[i] + row * row_stride_bytes_;
+    }
+
+    ESP_LOGI(TAG, "Buffer %c allocated: %d rows × %zu bytes/row = %zu total (%s)", name, num_rows_, row_stride_bytes_,
+             total_buffer_bytes_, buffer_in_psram_[i] ? "PSRAM" : "internal RAM");
+  }
+
+  // Single buffer: CPU and DMA share buffer 0. Double buffer: DMA shows 0, CPU draws into 1.
+  front_idx_ = 0;
+  active_idx_ = is_double_buffered() ? 1 : 0;
+
+  return true;
+}
+
+bool GdmaDma::configure_dma_transfer() {
+  const bool access_ext_mem = buffer_in_psram_[0] || buffer_in_psram_[1];
+  const size_t bytes_per_bitplane = dma_width_ * sizeof(uint16_t);
+
+  // Internal SRAM keeps the 32-byte burst. For PSRAM use the largest external memory block
+  // size (16/32/64, capped at 64 by the PSRAM controller) that divides a bit plane, so every
+  // descriptor starts and ends on a block boundary.
+  size_t burst = 32;
+  if (access_ext_mem) {
+    burst = (bytes_per_bitplane % 64 == 0) ? 64 : (bytes_per_bitplane % 32 == 0) ? 32 : 16;
+  }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+  gdma_transfer_config_t transfer_config = {};
+  transfer_config.max_data_burst_size = burst;
+  transfer_config.access_ext_mem = access_ext_mem;
+  esp_err_t err = gdma_config_transfer(dma_chan_, &transfer_config);
+#else
+  gdma_transfer_ability_t ability = {};
+  ability.sram_trans_align = 32;
+  ability.psram_trans_align = access_ext_mem ? burst : 0;
+  esp_err_t err = gdma_set_transfer_ability(dma_chan_, &ability);
+#endif
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure GDMA transfer: %s", esp_err_to_name(err));
     return false;
   }
 
-  // Allocate metadata array for buffer A
-  row_buffers_[0] = new RowBitPlaneBuffer[num_rows_];
-
-  // Point each row's metadata into the single allocation
-  uint8_t *current_ptr = dma_buffers_[0];
-  for (int row = 0; row < num_rows_; row++) {
-    row_buffers_[0][row].buffer_size = buffer_size_per_row;
-    row_buffers_[0][row].data = current_ptr;
-    current_ptr += buffer_size_per_row;
-  }
-
-  // Set indices for single-buffer mode (both point to buffer 0)
-  front_idx_ = 0;
-  active_idx_ = 0;
-
-  ESP_LOGI(TAG, "Buffer A allocated: %d rows × %zu bytes/row = %zu total", num_rows_, buffer_size_per_row,
-           total_buffer_size);
-
-  // Conditionally allocate second buffer (buffer B, index 1)
-  if (config_.double_buffer) {
-    ESP_LOGI(TAG, "Allocating buffer B: %zu bytes (double buffering enabled)", total_buffer_size);
-    dma_buffers_[1] = (uint8_t *) heap_caps_calloc(1, total_buffer_size, DMA_MEM_CAPS);
-    if (!dma_buffers_[1]) {
-      ESP_LOGE(TAG, "Failed to allocate %zu bytes for buffer B", total_buffer_size);
-      // Continue in single-buffer mode
-      ESP_LOGW(TAG, "Continuing in single-buffer mode");
-      return true;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
+  // Descriptors point at bit planes, so each bit plane start and size must meet the channel's
+  // alignment for the memory it lives in.
+  size_t int_align = 1, ext_align = 1;
+  gdma_get_alignment_constraints(dma_chan_, &int_align, &ext_align);
+  for (int i = 0; i < 2; i++) {
+    if (!dma_buffers_[i]) {
+      continue;
     }
-
-    // Allocate metadata array for buffer B
-    row_buffers_[1] = new RowBitPlaneBuffer[num_rows_];
-
-    // Point each row's metadata into the single allocation
-    current_ptr = dma_buffers_[1];
-    for (int row = 0; row < num_rows_; row++) {
-      row_buffers_[1][row].buffer_size = buffer_size_per_row;
-      row_buffers_[1][row].data = current_ptr;
-      current_ptr += buffer_size_per_row;
+    const size_t align = buffer_in_psram_[i] ? ext_align : int_align;
+    if (((uintptr_t) dma_buffers_[i] % align) != 0 || (bytes_per_bitplane % align) != 0) {
+      ESP_LOGE(TAG, "Buffer %c at %p does not meet the GDMA alignment of %zu bytes", 'A' + i, dma_buffers_[i], align);
+      return false;
     }
-
-    // Set indices for double-buffer mode (front=0, active=1)
-    active_idx_ = 1;
-
-    ESP_LOGI(TAG, "Buffer B allocated: %d rows × %zu bytes/row = %zu total (double buffer mode)", num_rows_,
-             buffer_size_per_row, total_buffer_size);
   }
+#endif
 
+  ESP_LOGI(TAG, "GDMA transfer: burst %zu bytes, external memory access %s", burst, access_ext_mem ? "on" : "off");
   return true;
 }
 
@@ -556,6 +613,12 @@ void GdmaDma::shutdown() {
       delete[] row_buffers_[i];
       row_buffers_[i] = nullptr;
     }
+
+    buffer_in_psram_[i] = false;
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+    dirty_row_begin_[i] = UINT16_MAX;
+    dirty_row_end_[i] = 0;
+#endif
   }
 
   descriptor_count_ = 0;
@@ -698,11 +761,15 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         }
       }
     }
-    if (!config_.double_buffer) {
-      flush_cache_to_dma();
+    mark_all_rows_dirty(active_idx_);
+    if (!is_double_buffered()) {
+      sync_dirty_rows(active_idx_);
     }
     return;
   }
+
+  // Rows touched by the transformed path, for the PSRAM cache write-back
+  uint16_t touched_row_begin = UINT16_MAX, touched_row_end = 0;
 
   // Process each pixel
   const uint8_t *pixel_ptr = buffer;
@@ -749,6 +816,8 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         row = transformed.row;
         base_ptr = target_buffers[row].data;
         clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
+        touched_row_begin = std::min(touched_row_begin, row);
+        touched_row_end = std::max(touched_row_end, static_cast<uint16_t>(row + 1));
       }
 
       HUB75_PROFILE_STAGE(PROFILE_TRANSFORM);
@@ -803,8 +872,14 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       HUB75_PROFILE_PIXEL();
     }
   }
-  if (!config_.double_buffer) {
-    flush_cache_to_dma();
+  // Marked after the writes, so a concurrent full write-back cannot drop them
+  if (identity_transform) {
+    mark_y_span_dirty(active_idx_, y, h);
+  } else {
+    mark_rows_dirty(active_idx_, touched_row_begin, touched_row_end);
+  }
+  if (!is_double_buffered()) {
+    sync_dirty_rows(active_idx_);
   }
 }
 
@@ -827,8 +902,9 @@ void GdmaDma::clear() {
       }
     }
   }
-  if (!config_.double_buffer) {
-    flush_cache_to_dma();
+  mark_all_rows_dirty(active_idx_);
+  if (!is_double_buffered()) {
+    sync_dirty_rows(active_idx_);
   }
 }
 
@@ -878,6 +954,9 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
   const size_t bit_plane_stride = dma_width_ * 2;
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
+  // Rows touched by the transformed path, for the PSRAM cache write-back
+  uint16_t touched_row_begin = UINT16_MAX, touched_row_end = 0;
+
   // Fill loop
   for (uint16_t dy = 0; dy < h; dy++) {
     const uint16_t py = y + dy;
@@ -921,6 +1000,8 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
         base_ptr = target_buffers[transformed.row].data;
         clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
         patterns = transformed.is_lower ? lower_patterns : upper_patterns;
+        touched_row_begin = std::min(touched_row_begin, static_cast<uint16_t>(transformed.row));
+        touched_row_end = std::max(touched_row_end, static_cast<uint16_t>(transformed.row + 1));
       }
 
       // Update all bit planes (branch-free inner loop)
@@ -930,8 +1011,14 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
       }
     }
   }
-  if (!config_.double_buffer) {
-    flush_cache_to_dma();
+  // Marked after the writes, so a concurrent full write-back cannot drop them
+  if (identity_transform) {
+    mark_y_span_dirty(active_idx_, y, h);
+  } else {
+    mark_rows_dirty(active_idx_, touched_row_begin, touched_row_end);
+  }
+  if (!is_double_buffered()) {
+    sync_dirty_rows(active_idx_);
   }
 }
 
@@ -941,9 +1028,8 @@ void GdmaDma::flip_buffer() {
     return;
   }
 
-  // Flush CPU cache for active buffer BEFORE swap (buffer we were drawing to)
-  // Only needed in double buffer mode (draw/clear/fill skip flush, defer to here)
-  flush_cache_to_dma();
+  // Make everything drawn since the last flip visible to the DMA before it is displayed
+  sync_dirty_rows(active_idx_);
 
   // Seamless descriptor chain redirection (no stop/start!)
   //
@@ -1075,9 +1161,11 @@ void GdmaDma::initialize_blank_buffers() {
   }
 
   ESP_LOGI(TAG, "Initializing blank DMA buffers with control bits...");
-  for (auto &row_buffer : row_buffers_) {
-    if (row_buffer) {
-      initialize_buffer_internal(row_buffer);
+  for (int i = 0; i < 2; i++) {
+    if (row_buffers_[i]) {
+      initialize_buffer_internal(row_buffers_[i]);
+      mark_all_rows_dirty(i);
+      sync_dirty_rows(i);
     }
   }
   ESP_LOGI(TAG, "Blank buffers initialized");
@@ -1233,14 +1321,15 @@ void GdmaDma::set_brightness_oe() {
 
   ESP_LOGD(TAG, "Setting brightness OE: brightness=%u, lsbMsbTransitionBit=%u", brightness, lsbMsbTransitionBit_);
 
-  // Update OE bits in all allocated buffers
-  for (auto &row_buffer : row_buffers_) {
-    if (row_buffer) {
-      set_brightness_oe_internal(row_buffer, brightness);
+  // Update OE bits in all allocated buffers. Both are rewritten, so both are written back:
+  // the back buffer becomes the front one on the next flip.
+  for (int i = 0; i < 2; i++) {
+    if (row_buffers_[i]) {
+      set_brightness_oe_internal(row_buffers_[i], brightness);
+      mark_all_rows_dirty(i);
+      sync_dirty_rows(i);
     }
   }
-
-  flush_cache_to_dma();
 
   ESP_LOGD(TAG, "Brightness OE configuration complete");
 }
@@ -1338,9 +1427,12 @@ bool GdmaDma::build_descriptor_chain() {
     }
   }
 
+  // GDMA only fetches descriptors from internal RAM
+  constexpr uint32_t DESCRIPTOR_CAPS = MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL;
+
   // Always allocate first descriptor chain (buffer 0)
   // Use calloc to zero-initialize descriptor memory (prevents garbage in control bits)
-  descriptors_[0] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA);
+  descriptors_[0] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, DESCRIPTOR_CAPS);
   if (!descriptors_[0]) {
     ESP_LOGE(TAG, "Failed to allocate %zu descriptors [0] (%zu bytes) in DMA memory", descriptor_count_,
              total_descriptor_bytes);
@@ -1354,9 +1446,9 @@ bool GdmaDma::build_descriptor_chain() {
   ESP_LOGI(TAG, "BCM descriptor chain [0] built: %zu descriptors in continuous loop", descriptor_count_);
 
   // Conditionally allocate second descriptor chain (buffer 1)
-  if (config_.double_buffer) {
+  if (is_double_buffered()) {
     // Use calloc to zero-initialize descriptor memory (prevents garbage in control bits)
-    descriptors_[1] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, MALLOC_CAP_DMA);
+    descriptors_[1] = (dma_descriptor_t *) heap_caps_calloc(1, total_descriptor_bytes, DESCRIPTOR_CAPS);
     if (!descriptors_[1]) {
       ESP_LOGE(TAG, "Failed to allocate %zu descriptors [1] (%zu bytes) in DMA memory", descriptor_count_,
                total_descriptor_bytes);
@@ -1446,23 +1538,51 @@ void GdmaDma::calculate_bcm_timings() {
   ESP_LOGI(TAG, "BCM timing calculated (lsbMsbTransitionBit used by set_brightness_oe for OE control)");
 }
 
-void GdmaDma::flush_cache_to_dma() {
-#if HUB75_EXTERNAL_FRAMEBUFFERS == 1
-  // Only flush for PSRAM (external RAM); internal SRAM does not need cache sync.
-#if (ESP_IDF_VERSION_MAJOR >= 5)
-  if (!dma_buffers_[active_idx_] || !esp_ptr_external_ram(dma_buffers_[active_idx_])) {
+void GdmaDma::mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h) {
+  if (h == 0) {
+    return;
+  }
+  // Identity transform: display row py lives in DMA row py (upper half) or py - num_rows_
+  // (lower half). A span crossing the halves touches rows from 0 up to num_rows_.
+  const uint16_t last_y = y + h - 1;
+  if (last_y < num_rows_) {
+    mark_rows_dirty(buffer_idx, y, last_y + 1);
+  } else if (y >= num_rows_) {
+    mark_rows_dirty(buffer_idx, y - num_rows_, last_y - num_rows_ + 1);
+  } else {
+    mark_all_rows_dirty(buffer_idx);
+  }
+}
+
+void GdmaDma::sync_dirty_rows(int buffer_idx) {
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  const uint16_t begin = dirty_row_begin_[buffer_idx];
+  const uint16_t end = dirty_row_end_[buffer_idx];
+  dirty_row_begin_[buffer_idx] = UINT16_MAX;
+  dirty_row_end_[buffer_idx] = 0;
+  if (!buffer_in_psram_[buffer_idx] || begin >= end) {
     return;
   }
 
-  // Flush cache: CPU cache → PSRAM (C2M = Cache to Memory)
-  esp_err_t err = esp_cache_msync(dma_buffers_[active_idx_], total_buffer_bytes_,
-                                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Cache sync failed: %s", esp_err_to_name(err));
-  }
+  // Widen the row range to whole cache lines. The allocation is aligned and padded to
+  // PSRAM_FB_ALIGNMENT, so the widened range never leaves this buffer.
+  const size_t start = (begin * row_stride_bytes_) & ~(PSRAM_FB_ALIGNMENT - 1);
+  const size_t stop =
+      std::min(total_buffer_bytes_, (end * row_stride_bytes_ + PSRAM_FB_ALIGNMENT - 1) & ~(PSRAM_FB_ALIGNMENT - 1));
+  uint8_t *const addr = dma_buffers_[buffer_idx] + start;
+  const size_t size = stop - start;
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+  const esp_err_t err = esp_cache_msync(addr, size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+  // C2M is the only (implicit) direction before IDF 5.2
+  const esp_err_t err = esp_cache_msync(addr, size, 0);
 #else
-  Cache_WriteBack_Addr((uint32_t) dma_buffers_[active_idx_], total_buffer_bytes_);
+  const esp_err_t err = Cache_WriteBack_Addr((uint32_t) addr, size) == 0 ? ESP_OK : ESP_FAIL;
 #endif
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "PSRAM cache write-back failed: %s", esp_err_to_name(err));
+  }
 #endif
 }
 

@@ -13,6 +13,7 @@
 #include "hub75_config.h"
 #include "hub75_internal.h"  // For Hub75FramebufferFormat
 #include "../platform_dma.h"
+#include <algorithm>
 #include <cstddef>
 #include <variant>
 #include <esp_private/gdma.h>
@@ -128,6 +129,8 @@ class GdmaDma : public PlatformDma {
 
   // Buffer management
   bool allocate_row_buffers();
+  uint8_t *allocate_framebuffer(size_t size, bool *in_psram);
+  bool configure_dma_transfer();
   bool validate_brightness_config();  // Validate safety margins for brightness OE configuration
   void initialize_blank_buffers();    // Initialize DMA buffers with control bits only
   void initialize_buffer_internal(RowBitPlaneBuffer *buffers);                      // Helper: initialize one buffer set
@@ -140,9 +143,26 @@ class GdmaDma : public PlatformDma {
   // BCM timing calculation (calculates lsbMsbTransitionBit for OE control)
   void calculate_bcm_timings();
 
-  void flush_cache_to_dma();
+  // True once buffer B exists; the driver falls back to single buffering when it cannot be allocated.
+  bool is_double_buffered() const { return row_buffers_[1] != nullptr; }
 
-  size_t total_buffer_bytes_;  // Cached total buffer size per buffer (computed once, never changes)
+  // PSRAM framebuffers are written through the CPU data cache, while GDMA reads PSRAM directly.
+  // Writers record the rows they touched and the dirty range is written back to PSRAM in one
+  // esp_cache_msync() before the DMA can see it: at the end of each draw call in single-buffer
+  // mode, at flip_buffer() in double-buffer mode. All of this compiles away without
+  // HUB75_EXTERNAL_FRAMEBUFFERS.
+  void mark_rows_dirty(int buffer_idx, uint16_t first_row, uint16_t end_row) {
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+    dirty_row_begin_[buffer_idx] = std::min(dirty_row_begin_[buffer_idx], first_row);
+    dirty_row_end_[buffer_idx] = std::max(dirty_row_end_[buffer_idx], end_row);
+#endif
+  }
+  void mark_all_rows_dirty(int buffer_idx) { mark_rows_dirty(buffer_idx, 0, num_rows_); }
+  void mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h);  // Identity transform only
+  void sync_dirty_rows(int buffer_idx);
+
+  size_t row_stride_bytes_;    // Bytes per row (all bit planes of one row)
+  size_t total_buffer_bytes_;  // Allocated bytes per buffer (padded to the PSRAM alignment when in PSRAM)
 
   gdma_channel_handle_t dma_chan_;
   const uint8_t bit_depth_;         // Bit depth from config (6, 7, 8, 10, or 12)
@@ -175,10 +195,17 @@ class GdmaDma : public PlatformDma {
   // [0] = buffer A (always allocated), [1] = buffer B (nullptr if single-buffer mode)
   uint8_t *dma_buffers_[2];            // Raw buffer allocations (single calloc per buffer)
   RowBitPlaneBuffer *row_buffers_[2];  // Metadata arrays pointing into dma_buffers_
+  bool buffer_in_psram_[2];            // Allocation landed in PSRAM (needs cache write-back before DMA sees it)
   dma_descriptor_t *descriptors_[2];   // Descriptor chains (one per buffer)
 
   int front_idx_;   // DMA displays buffers[front_idx_]
   int active_idx_;  // CPU draws to buffers[active_idx_]
+
+#if HUB75_EXTERNAL_FRAMEBUFFERS
+  // Dirty row range [begin, end) per buffer; begin >= end means clean.
+  uint16_t dirty_row_begin_[2];
+  uint16_t dirty_row_end_[2];
+#endif
 
   size_t descriptor_count_;  // Number of descriptors per chain
 

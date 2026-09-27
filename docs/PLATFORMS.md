@@ -8,7 +8,7 @@ Detailed comparison and implementation notes for ESP32 platform variants.
 |---------|-------|----------|----------|----------|----------|
 | **Peripheral** | I2S (LCD mode) | I2S (LCD mode) | LCD_CAM | PARLIO | PARLIO |
 | **DMA Engine** | I2S DMA | I2S DMA | GDMA (AHB) | EDMA | EDMA |
-| **Memory** | Internal SRAM | Internal SRAM | Internal SRAM | **PSRAM** | Internal SRAM |
+| **Memory** | Internal SRAM | Internal SRAM | Internal SRAM (PSRAM optional) | **PSRAM** | Internal SRAM |
 | **Buffer Size** (64×64) | ~57 KB | ~57 KB | ~57 KB | ~284 KB | ~284 KB |
 | **BCM Method** | Descriptor dup | Descriptor dup | Descriptor dup | Buffer padding | Buffer padding |
 | **Clock Gating** | No | No | No | **Yes** (MSB) | **No** |
@@ -182,7 +182,7 @@ All standard frequencies (8/10/16/20/32 MHz) divide evenly from 160 MHz.
 
 ### Memory Layout
 
-**Location**: Internal SRAM (DMA-capable)
+**Location**: Internal SRAM (DMA-capable). With `HUB75_EXTERNAL_FRAMEBUFFERS` the row buffers move to PSRAM while the descriptors stay in internal SRAM.
 
 **Components**:
 1. **Framebuffer**: `width × height × 4 bytes` (internal SRAM)

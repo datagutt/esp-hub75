@@ -3,6 +3,13 @@
 
 menu "HUB75 RGB LED Matrix Driver"
 
+    config HUB75_KCONFIG_PRESENT
+        bool
+        default y
+        help
+            Lets hub75_config.h tell a disabled option apart from a build
+            that does not load this Kconfig at all.
+
     # ========================================
     # Board Presets (Quick Pin Setup)
     # ========================================
@@ -735,18 +742,26 @@ menu "HUB75 RGB LED Matrix Driver"
                 Disable only if IRAM space is critically constrained.
 
         config HUB75_EXTERNAL_FRAMEBUFFERS
-            bool "Use External Framebuffers"
-            depends on SOC_SPIRAM_SUPPORTED
+            bool "Allocate DMA framebuffers in PSRAM"
+            depends on SPIRAM && (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4)
             default y if IDF_TARGET_ESP32P4
             default n
             help
-                Allocates the framebuffers in external memory (PSRAM/SPIRAM).
-                Reduces internal memory usage at the cost of higher SPIRAM
-                bandwidth pressure.
+                Allocates the DMA framebuffers in external memory (PSRAM)
+                instead of internal RAM. DMA descriptors stay in internal RAM.
+                Only ESP32-S3 (GDMA) and ESP32-P4 (PARLIO) can stream from
+                PSRAM; the ESP32 and ESP32-S2 I2S DMA cannot.
 
-                If enabled, the HUB75 clock speed may need to be lowered to
-                avoid overloading the SPIRAM bandwidth, especially since it
-                is also shared with other modules such as WiFi.
+                On ESP32-S3 this frees the framebuffer from internal RAM
+                (64 KB per buffer for a 128x64 panel at 8 bit depth). If a
+                PSRAM allocation fails the driver falls back to internal RAM.
+
+                The display then streams continuously from PSRAM
+                (output clock x 2 bytes per second, 64 MB/s at 32 MHz), sharing
+                the SPI bus with the CPU cache, other DMA users and flash
+                writes. Use octal PSRAM at 80 MHz or faster and lower the
+                output clock if the panel flickers or shows corruption under
+                load, especially during flash writes (OTA, NVS, filesystem).
 
     endmenu
 
