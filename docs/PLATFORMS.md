@@ -182,7 +182,7 @@ All standard frequencies (8/10/16/20/32 MHz) divide evenly from 160 MHz.
 
 ### Memory Layout
 
-**Location**: Internal SRAM (DMA-capable). With `HUB75_EXTERNAL_FRAMEBUFFERS` the row buffers move to PSRAM while the descriptors stay in internal SRAM.
+**Location**: Internal SRAM (DMA-capable). With `HUB75_EXTERNAL_FRAMEBUFFERS` the framebuffers move to PSRAM and the GDMA plays a small internal bounce ring that an interrupt refills row by row.
 
 **Components**:
 1. **Framebuffer**: `width × height × 4 bytes` (internal SRAM)

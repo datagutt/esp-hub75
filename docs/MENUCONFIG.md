@@ -41,10 +41,11 @@ Or: **HUB75 Display Configuration** (panel/pin configuration)
 - **Type**: bool
 - **Default**: No on ESP32-S3, Yes on ESP32-P4
 - **Depends on**: SPIRAM, and ESP32-S3 or ESP32-P4 (the ESP32 and ESP32-S2 I2S DMA cannot read PSRAM, so the option does not exist there)
-- **Description**: Allocates the DMA framebuffers in PSRAM. DMA descriptors stay in internal RAM. If a PSRAM allocation fails, that buffer falls back to internal RAM with a warning.
-- **Memory impact (ESP32-S3)**: Frees the framebuffers from internal RAM, for example 64 KB per buffer for a 128×64 panel at 8 bit depth (128 KB with double buffering)
-- **Bandwidth**: The panel streams continuously from PSRAM at output clock × 2 bytes per second (64 MB/s at 32 MHz), shared with the CPU cache, other DMA users and flash writes on the same SPI bus. Use octal PSRAM at 80 MHz or faster on ESP32-S3, and lower `HUB75_CLOCK_SPEED` if the panel flickers or shows corruption under load or during flash writes (OTA, NVS, filesystems).
-- **Cache**: CPU writes go through the data cache. The driver writes dirty rows back to PSRAM once per draw call in single buffer mode and once per `flip_buffer()` in double buffer mode.
+- **Description**: Allocates the framebuffers in PSRAM. If a PSRAM allocation fails, that buffer falls back to internal RAM with a warning.
+- **ESP32-S3 (bounce buffers)**: the GDMA never reads PSRAM. It plays a ring of `HUB75_BOUNCE_ROWS` (default 4) row slots in internal RAM, and an IRAM interrupt at the end of each slot copies the row due next from the front framebuffer, the scheme the IDF RGB LCD driver uses for PSRAM frame buffers. `flip_buffer()` hands the new buffer to that interrupt, which switches at the next row 0, and waits until it has (at most one refresh).
+- **Memory impact (ESP32-S3)**: internal RAM holds only the ring (2 KB per slot for a 128 pixel wide chain at 8 bit depth) and its descriptors (about 800 bytes per slot), instead of 64 KB per framebuffer plus a full descriptor chain for a 128×64 panel.
+- **CPU cost**: one row copy from PSRAM per row time (about 3,800 per second at 120 Hz on a 1/32 scan panel). The driver logs the measured interrupt time a few seconds after start.
+- **Flash writes**: enable `SPIRAM_XIP_FROM_PSRAM` so the cache, and with it the refill interrupt, keeps running while flash is written (OTA, NVS, filesystems). Without it, rows repeat on the panel during flash writes. With it, a registered frame callback must be in IRAM.
 
 ### HUB75_DEBUG_TIMING
 - **Type**: bool

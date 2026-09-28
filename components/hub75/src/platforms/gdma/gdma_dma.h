@@ -13,16 +13,21 @@
 #include "hub75_config.h"
 #include "hub75_internal.h"  // For Hub75FramebufferFormat
 #include "../platform_dma.h"
-#include <algorithm>
 #include <cstddef>
 #include <variant>
 #include <esp_private/gdma.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <hal/dma_types.h>
 
 namespace hub75 {
 
 // Forward declaration
 class Framebuffer;
+
+// Upper bound for CONFIG_HUB75_BOUNCE_ROWS (sizes the ISR's per-slot bookkeeping)
+static constexpr int HUB75_BOUNCE_MAX_ROWS = 16;
 
 /**
  * @brief ESP32-S3 GDMA + LCD_CAM implementation for HUB75
@@ -144,23 +149,19 @@ class GdmaDma : public PlatformDma {
   // True once buffer B exists; the driver falls back to single buffering when it cannot be allocated.
   bool is_double_buffered() const { return row_buffers_[1] != nullptr; }
 
-  // PSRAM framebuffers are written through the CPU data cache, while GDMA reads PSRAM directly.
-  // Writers record the rows they touched and the dirty range is written back to PSRAM in one
-  // esp_cache_msync() before the DMA can see it: at the end of each draw call in single-buffer
-  // mode, at flip_buffer() in double-buffer mode. All of this compiles away without
-  // HUB75_EXTERNAL_FRAMEBUFFERS.
-  void mark_rows_dirty(int buffer_idx, uint16_t first_row, uint16_t end_row) {
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-    dirty_row_begin_[buffer_idx] = std::min(dirty_row_begin_[buffer_idx], first_row);
-    dirty_row_end_[buffer_idx] = std::max(dirty_row_end_[buffer_idx], end_row);
-#endif
-  }
-  void mark_all_rows_dirty(int buffer_idx) { mark_rows_dirty(buffer_idx, 0, num_rows_); }
-  void mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h);  // Identity transform only
-  void sync_dirty_rows(int buffer_idx);
+  // Bounce mode (PSRAM framebuffers on ESP32-S3). The GDMA never reads PSRAM: its chain
+  // loops over a small ring of row slots in internal RAM, and an EOF interrupt per slot copies
+  // the row due next from the front framebuffer into the slot that just finished. The CPU
+  // reads PSRAM through its own cache, so no cache write-back is needed, and with
+  // CONFIG_SPIRAM_XIP_FROM_PSRAM the cache stays up during flash writes (OTA, NVS).
+  bool build_bounce_chain();
+  void prefill_bounce_ring();
+  static bool IRAM_ATTR on_bounce_eof(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data);
+  static void log_bounce_stats(void *arg);
+  void wait_for_bounce_flip();
 
   size_t row_stride_bytes_;    // Bytes per row (all bit planes of one row)
-  size_t total_buffer_bytes_;  // Allocated bytes per buffer (padded to the PSRAM alignment when in PSRAM)
+  size_t total_buffer_bytes_;  // Allocated bytes per buffer
 
   gdma_channel_handle_t dma_chan_;
   const uint8_t bit_depth_;         // Bit depth from config (6, 7, 8, 10, or 12)
@@ -193,21 +194,33 @@ class GdmaDma : public PlatformDma {
   // [0] = buffer A (always allocated), [1] = buffer B (nullptr if single-buffer mode)
   uint8_t *dma_buffers_[2];            // Raw buffer allocations (single calloc per buffer)
   RowBitPlaneBuffer *row_buffers_[2];  // Metadata arrays pointing into dma_buffers_
-  bool buffer_in_psram_[2];            // Allocation landed in PSRAM (needs cache write-back before DMA sees it)
+  bool buffer_in_psram_[2];            // Allocation landed in PSRAM (the display then runs in bounce mode)
 
-  // One descriptor chain serves both buffers and always points at buffers[front_idx_].
-  // flip_buffer() retargets it instead of keeping a second chain, which would cost another
-  // descriptor_count_ * 12 bytes of internal RAM (GDMA cannot fetch descriptors from PSRAM).
+  // Direct mode: one descriptor chain serves both framebuffers and always points at
+  // buffers[front_idx_]; flip_buffer() retargets it instead of keeping a second chain, which
+  // would cost another descriptor_count_ * 12 bytes of internal RAM.
+  // Bounce mode: the chain covers the bounce ring only and never changes.
   dma_descriptor_t *descriptors_;
 
   int front_idx_;   // DMA displays buffers[front_idx_]
   int active_idx_;  // CPU draws to buffers[active_idx_]
 
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-  // Dirty row range [begin, end) per buffer; begin >= end means clean.
-  uint16_t dirty_row_begin_[2];
-  uint16_t dirty_row_end_[2];
-#endif
+  // Bounce mode state. Everything the ISR touches lives in this (internal RAM) object.
+  bool bounce_mode_ = false;
+  uint8_t *bounce_ring_ = nullptr;  // bounce_slots_ rows of row_stride_bytes_, internal DMA RAM
+  uint8_t bounce_slots_ = 0;
+  size_t descs_per_row_ = 0;
+  uint8_t bounce_next_slot_ = 0;                           // Next slot the ISR refills
+  uint16_t bounce_next_row_ = 0;                           // Row that slot receives
+  uint16_t bounce_slot_row_[HUB75_BOUNCE_MAX_ROWS] = {0};  // Row held by each slot
+  uint16_t bounce_sync_row_ = 0;                           // Row whose EOF is the frame boundary callback
+  const uint8_t *volatile bounce_src_ = nullptr;           // Framebuffer the ISR copies from
+  const uint8_t *volatile bounce_pending_src_ = nullptr;   // Set by flip, taken at the next row 0
+  SemaphoreHandle_t bounce_flip_sem_ = nullptr;
+  uint32_t bounce_refills_ = 0;
+  uint32_t bounce_cycles_total_ = 0;
+  uint32_t bounce_cycles_max_ = 0;
+  esp_timer_handle_t bounce_stats_timer_ = nullptr;
 
   size_t descriptor_count_;  // Number of descriptors in the chain
 

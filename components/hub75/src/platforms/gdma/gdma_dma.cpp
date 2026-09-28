@@ -42,12 +42,12 @@
 #include <driver/periph_ctrl.h>
 #endif
 #include <esp_heap_caps.h>
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
-#include <esp_cache.h>
+#if ESP_IDF_VERSION_MAJOR >= 5
+#include <esp_cpu.h>
+#define HUB75_CPU_CYCLES() esp_cpu_get_cycle_count()
 #else
-#include <rom/cache.h>
-#endif
+#include <hal/cpu_hal.h>
+#define HUB75_CPU_CYCLES() cpu_hal_get_cycle_count()
 #endif
 
 static const char *const TAG = "GdmaDma";
@@ -82,11 +82,16 @@ constexpr uint16_t RGB_MASK = RGB_UPPER_MASK | RGB_LOWER_MASK;  // 0x003F
 // Bit clear masks
 constexpr uint16_t OE_CLEAR_MASK = ~(1 << OE_BIT);
 
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-// PSRAM framebuffers start and end on this boundary so that cache write-backs never touch a
-// neighbouring allocation. 64 bytes is the largest ESP32-S3 data cache line (16/32/64 are
-// configurable) and the largest GDMA external memory block size.
-constexpr size_t PSRAM_FB_ALIGNMENT = 64;
+// The bounce ISR copies rows out of PSRAM, so it may only run while flash is written (cache
+// disabled) when PSRAM stays mapped then, which is what SPIRAM_XIP_FROM_PSRAM provides.
+#if HUB75_EXTERNAL_FRAMEBUFFERS && CONFIG_SPIRAM_XIP_FROM_PSRAM
+constexpr bool GDMA_ISR_CACHE_SAFE = true;
+#else
+constexpr bool GDMA_ISR_CACHE_SAFE = false;
+#endif
+
+#ifndef CONFIG_HUB75_BOUNCE_ROWS
+#define CONFIG_HUB75_BOUNCE_ROWS 4
 #endif
 
 GdmaDma::GdmaDma(const Hub75Config &config)
@@ -119,10 +124,6 @@ GdmaDma::GdmaDma(const Hub75Config &config)
       descriptors_(nullptr),
       front_idx_(0),
       active_idx_(0),
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-      dirty_row_begin_{UINT16_MAX, UINT16_MAX},
-      dirty_row_end_{0, 0},
-#endif
       descriptor_count_(0),
       basis_brightness_(config.brightness),  // Use config value (default: 128)
       intensity_(1.0f) {
@@ -160,21 +161,23 @@ bool GdmaDma::init() {
   // Allocate GDMA channel
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
   // ESP-IDF 6.0+: simplified config, direction via NULL parameter
-  gdma_channel_alloc_config_t dma_alloc_config = {.intr_priority = 0, .flags = {.isr_cache_safe = 0}};
+  gdma_channel_alloc_config_t dma_alloc_config = {.intr_priority = 0, .flags = {.isr_cache_safe = GDMA_ISR_CACHE_SAFE}};
   esp_err_t err = gdma_new_ahb_channel(&dma_alloc_config, &dma_chan_, nullptr);
 
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
   // ESP-IDF 5.4 - 5.x: gdma_new_ahb_channel (2-arg)
-  gdma_channel_alloc_config_t dma_alloc_config = {.sibling_chan = nullptr,
-                                                  .direction = GDMA_CHANNEL_DIRECTION_TX,
-                                                  .flags = {.reserve_sibling = 0, .isr_cache_safe = 0}};
+  gdma_channel_alloc_config_t dma_alloc_config = {
+      .sibling_chan = nullptr,
+      .direction = GDMA_CHANNEL_DIRECTION_TX,
+      .flags = {.reserve_sibling = 0, .isr_cache_safe = GDMA_ISR_CACHE_SAFE}};
   esp_err_t err = gdma_new_ahb_channel(&dma_alloc_config, &dma_chan_);
 
 #elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
   // ESP-IDF 5.0 - 5.3: gdma_new_channel with isr_cache_safe flag
-  gdma_channel_alloc_config_t dma_alloc_config = {.sibling_chan = nullptr,
-                                                  .direction = GDMA_CHANNEL_DIRECTION_TX,
-                                                  .flags = {.reserve_sibling = 0, .isr_cache_safe = 0}};
+  gdma_channel_alloc_config_t dma_alloc_config = {
+      .sibling_chan = nullptr,
+      .direction = GDMA_CHANNEL_DIRECTION_TX,
+      .flags = {.reserve_sibling = 0, .isr_cache_safe = GDMA_ISR_CACHE_SAFE}};
   esp_err_t err = gdma_new_channel(&dma_alloc_config, &dma_chan_);
 
 #else
@@ -274,7 +277,7 @@ bool GdmaDma::init() {
   set_brightness_oe();
 
   // Build descriptor chain (one descriptor per bit plane)
-  if (!build_descriptor_chain()) {
+  if (!(bounce_mode_ ? build_bounce_chain() : build_descriptor_chain())) {
     return false;
   }
 
@@ -404,25 +407,14 @@ void GdmaDma::configure_gpio() {
 uint8_t *GdmaDma::allocate_framebuffer(size_t size, bool *in_psram) {
   *in_psram = false;
 #if HUB75_EXTERNAL_FRAMEBUFFERS
-  // Each bit plane is one descriptor, and its size must be a whole number of 16-byte blocks
-  // (the smallest GDMA external memory block).
-  if ((dma_width_ * sizeof(uint16_t)) % 16 != 0) {
-    ESP_LOGW(TAG, "DMA width %u is not a multiple of 8 pixels, PSRAM framebuffers unavailable", dma_width_);
-  } else {
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
-    // The heap maps DMA | SPIRAM to PSRAM and adds any cache line or flash encryption alignment
-    constexpr uint32_t caps = MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM;
-#else
-    // Older heaps have no PSRAM region tagged DMA-capable
-    constexpr uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-#endif
-    auto *buf = (uint8_t *) heap_caps_aligned_calloc(PSRAM_FB_ALIGNMENT, 1, size, caps);
-    if (buf) {
-      *in_psram = true;
-      return buf;
-    }
-    ESP_LOGW(TAG, "PSRAM allocation of %zu bytes failed, falling back to internal RAM", size);
+  // Only the CPU touches PSRAM framebuffers (the bounce ISR copies rows out), so no DMA
+  // capability or cache line alignment is needed
+  auto *buf = (uint8_t *) heap_caps_calloc(1, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (buf) {
+    *in_psram = true;
+    return buf;
   }
+  ESP_LOGW(TAG, "PSRAM allocation of %zu bytes failed, falling back to internal RAM", size);
 #endif
   return (uint8_t *) heap_caps_calloc(1, size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
 }
@@ -436,10 +428,6 @@ bool GdmaDma::allocate_row_buffers() {
   }
   row_stride_bytes_ = bytes_per_bitplane * bit_depth_;
   total_buffer_bytes_ = num_rows_ * row_stride_bytes_;
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-  // Pad so the last cache line written back belongs to this buffer
-  total_buffer_bytes_ = (total_buffer_bytes_ + PSRAM_FB_ALIGNMENT - 1) & ~(PSRAM_FB_ALIGNMENT - 1);
-#endif
 
   const int buffer_count = config_.double_buffer ? 2 : 1;
   for (int i = 0; i < buffer_count; i++) {
@@ -469,55 +457,42 @@ bool GdmaDma::allocate_row_buffers() {
   front_idx_ = 0;
   active_idx_ = is_double_buffered() ? 1 : 0;
 
+  // Any PSRAM framebuffer switches the display to the bounce ring
+  bounce_mode_ = buffer_in_psram_[0] || buffer_in_psram_[1];
+  if (bounce_mode_) {
+    bounce_slots_ = static_cast<uint8_t>(std::min<int>({CONFIG_HUB75_BOUNCE_ROWS, HUB75_BOUNCE_MAX_ROWS, num_rows_}));
+    bounce_ring_ = (uint8_t *) heap_caps_calloc(bounce_slots_, row_stride_bytes_, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    bounce_flip_sem_ = xSemaphoreCreateBinary();
+    if (!bounce_ring_ || !bounce_flip_sem_) {
+      ESP_LOGE(TAG, "Failed to allocate the %u-row bounce ring", bounce_slots_);
+      return false;
+    }
+    ESP_LOGI(TAG, "Bounce ring: %u rows × %zu bytes = %zu bytes internal RAM", bounce_slots_, row_stride_bytes_,
+             bounce_slots_ * row_stride_bytes_);
+#if !CONFIG_SPIRAM_XIP_FROM_PSRAM
+    ESP_LOGW(TAG, "CONFIG_SPIRAM_XIP_FROM_PSRAM is off: rows go stale while flash is written (OTA, NVS)");
+#endif
+  }
+
   return true;
 }
 
 bool GdmaDma::configure_dma_transfer() {
-  const bool access_ext_mem = buffer_in_psram_[0] || buffer_in_psram_[1];
-  const size_t bytes_per_bitplane = dma_width_ * sizeof(uint16_t);
-
-  // Internal SRAM keeps the 32-byte burst. For PSRAM use the largest external memory block
-  // size (16/32/64, capped at 64 by the PSRAM controller) that divides a bit plane, so every
-  // descriptor starts and ends on a block boundary.
-  size_t burst = 32;
-  if (access_ext_mem) {
-    burst = (bytes_per_bitplane % 64 == 0) ? 64 : (bytes_per_bitplane % 32 == 0) ? 32 : 16;
-  }
-
+  // The GDMA only reads internal RAM: the framebuffers in direct mode, the bounce ring otherwise
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
   gdma_transfer_config_t transfer_config = {};
-  transfer_config.max_data_burst_size = burst;
-  transfer_config.access_ext_mem = access_ext_mem;
+  transfer_config.max_data_burst_size = 32;
+  transfer_config.access_ext_mem = false;
   esp_err_t err = gdma_config_transfer(dma_chan_, &transfer_config);
 #else
   gdma_transfer_ability_t ability = {};
   ability.sram_trans_align = 32;
-  ability.psram_trans_align = access_ext_mem ? burst : 0;
   esp_err_t err = gdma_set_transfer_ability(dma_chan_, &ability);
 #endif
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to configure GDMA transfer: %s", esp_err_to_name(err));
     return false;
   }
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0)
-  // Descriptors point at bit planes, so each bit plane start and size must meet the channel's
-  // alignment for the memory it lives in.
-  size_t int_align = 1, ext_align = 1;
-  gdma_get_alignment_constraints(dma_chan_, &int_align, &ext_align);
-  for (int i = 0; i < 2; i++) {
-    if (!dma_buffers_[i]) {
-      continue;
-    }
-    const size_t align = buffer_in_psram_[i] ? ext_align : int_align;
-    if (((uintptr_t) dma_buffers_[i] % align) != 0 || (bytes_per_bitplane % align) != 0) {
-      ESP_LOGE(TAG, "Buffer %c at %p does not meet the GDMA alignment of %zu bytes", 'A' + i, dma_buffers_[i], align);
-      return false;
-    }
-  }
-#endif
-
-  ESP_LOGI(TAG, "GDMA transfer: burst %zu bytes, external memory access %s", burst, access_ext_mem ? "on" : "off");
   return true;
 }
 
@@ -530,6 +505,17 @@ void GdmaDma::start_transfer() {
   ESP_LOGI(TAG, "Starting descriptor-chain DMA:");
   ESP_LOGI(TAG, "  Descriptor count: %zu", descriptor_count_);
   ESP_LOGI(TAG, "  Rows: %d, Bits: %d", num_rows_, bit_depth_);
+
+  if (bounce_mode_) {
+    prefill_bounce_ring();
+    gdma_tx_event_callbacks_t cbs = {};
+    cbs.on_trans_eof = GdmaDma::on_bounce_eof;
+    esp_err_t err = gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to register the bounce refill ISR: %s", esp_err_to_name(err));
+      return;
+    }
+  }
 
   // Prime LCD registers
   LCD_CAM.lcd_user.lcd_update = 1;
@@ -545,9 +531,25 @@ void GdmaDma::start_transfer() {
   LCD_CAM.lcd_user.lcd_start = 1;
 
   ESP_LOGI(TAG, "Descriptor-chain DMA transfer started - running continuously");
+
+  if (bounce_mode_) {
+    // One-time report of the refill ISR cost once it has run for a while
+    esp_timer_create_args_t args = {};
+    args.callback = &GdmaDma::log_bounce_stats;
+    args.arg = this;
+    args.name = "hub75_bounce";
+    if (esp_timer_create(&args, &bounce_stats_timer_) == ESP_OK) {
+      esp_timer_start_once(bounce_stats_timer_, 3 * 1000 * 1000);
+    }
+  }
 }
 
 void GdmaDma::stop_transfer() {
+  if (bounce_stats_timer_) {
+    esp_timer_stop(bounce_stats_timer_);
+    esp_timer_delete(bounce_stats_timer_);
+    bounce_stats_timer_ = nullptr;
+  }
   if (!dma_chan_) {
     return;
   }
@@ -564,7 +566,8 @@ void GdmaDma::stop_transfer() {
 void GdmaDma::set_frame_callback(Hub75FrameCallback callback, void *arg) {
   PlatformDma::set_frame_callback(callback, arg);
 
-  if (dma_chan_ && callback) {
+  // In bounce mode the refill ISR is always registered and calls frame_callback_ itself
+  if (dma_chan_ && callback && !bounce_mode_) {
     gdma_tx_event_callbacks_t cbs = {};
     cbs.on_trans_eof = GdmaDma::on_trans_eof;
     gdma_register_tx_event_callbacks(dma_chan_, &cbs, this);
@@ -615,12 +618,17 @@ void GdmaDma::shutdown() {
     }
 
     buffer_in_psram_[i] = false;
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-    dirty_row_begin_[i] = UINT16_MAX;
-    dirty_row_end_[i] = 0;
-#endif
   }
 
+  if (bounce_ring_) {
+    heap_caps_free(bounce_ring_);
+    bounce_ring_ = nullptr;
+  }
+  if (bounce_flip_sem_) {
+    vSemaphoreDelete(bounce_flip_sem_);
+    bounce_flip_sem_ = nullptr;
+  }
+  bounce_mode_ = false;
   descriptor_count_ = 0;
 
   ESP_LOGI(TAG, "Shutdown complete");
@@ -761,15 +769,8 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         }
       }
     }
-    mark_all_rows_dirty(active_idx_);
-    if (!is_double_buffered()) {
-      sync_dirty_rows(active_idx_);
-    }
     return;
   }
-
-  // Rows touched by the transformed path, for the PSRAM cache write-back
-  uint16_t touched_row_begin = UINT16_MAX, touched_row_end = 0;
 
   // Process each pixel
   const uint8_t *pixel_ptr = buffer;
@@ -816,8 +817,6 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
         row = transformed.row;
         base_ptr = target_buffers[row].data;
         clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
-        touched_row_begin = std::min(touched_row_begin, row);
-        touched_row_end = std::max(touched_row_end, static_cast<uint16_t>(row + 1));
       }
 
       HUB75_PROFILE_STAGE(PROFILE_TRANSFORM);
@@ -872,15 +871,6 @@ HUB75_IRAM void GdmaDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_
       HUB75_PROFILE_PIXEL();
     }
   }
-  // Marked after the writes, so a concurrent full write-back cannot drop them
-  if (identity_transform) {
-    mark_y_span_dirty(active_idx_, y, h);
-  } else {
-    mark_rows_dirty(active_idx_, touched_row_begin, touched_row_end);
-  }
-  if (!is_double_buffered()) {
-    sync_dirty_rows(active_idx_);
-  }
 }
 
 void GdmaDma::clear() {
@@ -901,10 +891,6 @@ void GdmaDma::clear() {
         buf[x] &= ~RGB_MASK;
       }
     }
-  }
-  mark_all_rows_dirty(active_idx_);
-  if (!is_double_buffered()) {
-    sync_dirty_rows(active_idx_);
   }
 }
 
@@ -954,9 +940,6 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
   const size_t bit_plane_stride = dma_width_ * 2;
   const bool identity_transform = (rotation_ == Hub75Rotation::ROTATE_0) && !needs_layout_remap_ && !needs_scan_remap_;
 
-  // Rows touched by the transformed path, for the PSRAM cache write-back
-  uint16_t touched_row_begin = UINT16_MAX, touched_row_end = 0;
-
   // Fill loop
   for (uint16_t dy = 0; dy < h; dy++) {
     const uint16_t py = y + dy;
@@ -1000,8 +983,6 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
         base_ptr = target_buffers[transformed.row].data;
         clear_mask = transformed.is_lower ? ~RGB_LOWER_MASK : ~RGB_UPPER_MASK;
         patterns = transformed.is_lower ? lower_patterns : upper_patterns;
-        touched_row_begin = std::min(touched_row_begin, static_cast<uint16_t>(transformed.row));
-        touched_row_end = std::max(touched_row_end, static_cast<uint16_t>(transformed.row + 1));
       }
 
       // Update all bit planes (branch-free inner loop)
@@ -1011,15 +992,6 @@ HUB75_IRAM void GdmaDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, ui
       }
     }
   }
-  // Marked after the writes, so a concurrent full write-back cannot drop them
-  if (identity_transform) {
-    mark_y_span_dirty(active_idx_, y, h);
-  } else {
-    mark_rows_dirty(active_idx_, touched_row_begin, touched_row_end);
-  }
-  if (!is_double_buffered()) {
-    sync_dirty_rows(active_idx_);
-  }
 }
 
 void GdmaDma::flip_buffer() {
@@ -1028,8 +1000,11 @@ void GdmaDma::flip_buffer() {
     return;
   }
 
-  // Make everything drawn since the last flip visible to the DMA before it is displayed
-  sync_dirty_rows(active_idx_);
+  if (bounce_mode_) {
+    wait_for_bounce_flip();
+    std::swap(front_idx_, active_idx_);
+    return;
+  }
 
   // Retarget the running chain to the buffer just drawn (no stop/start).
   //
@@ -1052,6 +1027,151 @@ void GdmaDma::flip_buffer() {
   std::atomic_thread_fence(std::memory_order_seq_cst);
 
   std::swap(front_idx_, active_idx_);
+}
+
+void GdmaDma::wait_for_bounce_flip() {
+  // Hand the new front buffer to the ISR, which starts copying from it at the next row 0, so
+  // every refresh comes from one framebuffer. Wait until it has, because until then the ISR
+  // still reads the old front buffer that the caller is about to draw into (at most one
+  // refresh, about 8 ms at 120 Hz).
+  xSemaphoreTake(bounce_flip_sem_, 0);
+  bounce_pending_src_ = dma_buffers_[active_idx_];
+  if (xSemaphoreTake(bounce_flip_sem_, pdMS_TO_TICKS(100)) != pdTRUE) {
+    // Transfer not running: nothing reads the ring, switch directly
+    bounce_src_ = dma_buffers_[active_idx_];
+    bounce_pending_src_ = nullptr;
+  }
+}
+
+// Plain word copy kept in IRAM: the ISR may run while flash is written, when library memcpy
+// variants placed in flash are unreachable. Rows are 4-byte aligned multiples of 4 bytes.
+static inline void IRAM_ATTR copy_row(uint8_t *dst, const uint8_t *src, size_t bytes) {
+  auto *d = reinterpret_cast<uint32_t *>(dst);
+  const auto *s = reinterpret_cast<const uint32_t *>(src);
+  const size_t words = bytes / 4;
+  size_t i = 0;
+  for (; i + 4 <= words; i += 4) {
+    d[i] = s[i];
+    d[i + 1] = s[i + 1];
+    d[i + 2] = s[i + 2];
+    d[i + 3] = s[i + 3];
+  }
+  for (; i < words; i++) {
+    d[i] = s[i];
+  }
+}
+
+void GdmaDma::prefill_bounce_ring() {
+  bounce_src_ = dma_buffers_[front_idx_];
+  bounce_pending_src_ = nullptr;
+  for (uint8_t slot = 0; slot < bounce_slots_; slot++) {
+    copy_row(bounce_ring_ + slot * row_stride_bytes_, bounce_src_ + slot * row_stride_bytes_, row_stride_bytes_);
+    bounce_slot_row_[slot] = slot;
+  }
+  bounce_next_slot_ = 0;
+  bounce_next_row_ = bounce_slots_ % num_rows_;
+  const int configured_sync_row = config_.frame_sync_row;
+  bounce_sync_row_ =
+      (configured_sync_row >= 0 && configured_sync_row < num_rows_) ? configured_sync_row : (num_rows_ - 1);
+  bounce_refills_ = 0;
+  bounce_cycles_total_ = 0;
+  bounce_cycles_max_ = 0;
+}
+
+// Runs once per ring slot: the slot holding the row just read by the GDMA is free and gets
+// the row that is due bounce_slots_ rows later. If EOFs were merged (delayed ISR), every slot
+// up to the reported one is refilled.
+bool IRAM_ATTR GdmaDma::on_bounce_eof(gdma_channel_handle_t dma_chan, gdma_event_data_t *event_data, void *user_data) {
+  auto *self = static_cast<GdmaDma *>(user_data);
+  const uint32_t start = HUB75_CPU_CYCLES();
+  const auto *eof_desc = reinterpret_cast<const dma_descriptor_t *>(event_data->tx_eof_desc_addr);
+  const uint8_t done_slot = static_cast<uint8_t>((eof_desc - self->descriptors_) / self->descs_per_row_);
+
+  bool yield = false;
+  uint8_t slot = self->bounce_next_slot_;
+  for (uint8_t n = 0; n < self->bounce_slots_; n++) {
+    if (self->bounce_slot_row_[slot] == self->bounce_sync_row_ && self->frame_callback_) {
+      yield |= self->frame_callback_(self->frame_callback_arg_);
+    }
+
+    const uint16_t row = self->bounce_next_row_;
+    if (row == 0 && self->bounce_pending_src_) {
+      self->bounce_src_ = self->bounce_pending_src_;
+      self->bounce_pending_src_ = nullptr;
+      BaseType_t woken = pdFALSE;
+      xSemaphoreGiveFromISR(self->bounce_flip_sem_, &woken);
+      yield |= woken == pdTRUE;
+    }
+    copy_row(self->bounce_ring_ + slot * self->row_stride_bytes_, self->bounce_src_ + row * self->row_stride_bytes_,
+             self->row_stride_bytes_);
+    self->bounce_slot_row_[slot] = row;
+    self->bounce_next_row_ = (row + 1 == self->num_rows_) ? 0 : row + 1;
+
+    const bool last = slot == done_slot;
+    slot = (slot + 1 == self->bounce_slots_) ? 0 : slot + 1;
+    if (last) {
+      break;
+    }
+  }
+  self->bounce_next_slot_ = slot;
+
+  const uint32_t cycles = HUB75_CPU_CYCLES() - start;
+  self->bounce_refills_++;
+  self->bounce_cycles_total_ += cycles;
+  if (cycles > self->bounce_cycles_max_) {
+    self->bounce_cycles_max_ = cycles;
+  }
+  return yield;
+}
+
+void GdmaDma::log_bounce_stats(void *arg) {
+  auto *self = static_cast<GdmaDma *>(arg);
+  const uint32_t refills = self->bounce_refills_;
+  const float cycles_per_us = esp_rom_get_cpu_ticks_per_us();
+  const float row_us = self->descs_per_row_ * self->dma_width_ * 1000000.0f / self->actual_clock_hz_;
+  ESP_LOGI(TAG,
+           "Bounce refill ISR: %lu refills, avg %.1f us, max %.1f us per %zu-byte row; row time %.1f us, slack "
+           "%.1f us (%u slots)",
+           (unsigned long) refills, refills ? self->bounce_cycles_total_ / cycles_per_us / refills : 0.0f,
+           self->bounce_cycles_max_ / cycles_per_us, self->row_stride_bytes_, row_us,
+           row_us * (self->bounce_slots_ - 1), self->bounce_slots_);
+}
+
+bool GdmaDma::build_bounce_chain() {
+  descs_per_row_ = calculate_bcm_transmissions(bit_depth_, lsbMsbTransitionBit_);
+  descriptor_count_ = descs_per_row_ * bounce_slots_;
+  descriptors_ = (dma_descriptor_t *) heap_caps_calloc(descriptor_count_, sizeof(dma_descriptor_t),
+                                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  if (!descriptors_) {
+    ESP_LOGE(TAG, "Failed to allocate %zu bounce descriptors", descriptor_count_);
+    return false;
+  }
+
+  // Same BCM repetition per row as the direct chain, over the ring slots, with one EOF at the
+  // end of each slot for the refill ISR
+  const size_t bytes_per_bitplane = dma_width_ * sizeof(uint16_t);
+  size_t desc_idx = 0;
+  for (uint8_t slot = 0; slot < bounce_slots_; slot++) {
+    uint8_t *const slot_base = bounce_ring_ + slot * row_stride_bytes_;
+    for (int bit = 0; bit < bit_depth_; bit++) {
+      const int repetitions = (bit <= lsbMsbTransitionBit_) ? 1 : (1 << (bit - lsbMsbTransitionBit_ - 1));
+      for (int rep = 0; rep < repetitions; rep++) {
+        dma_descriptor_t *const desc = &descriptors_[desc_idx];
+        desc->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        desc->dw0.suc_eof = 0;
+        desc->dw0.size = bytes_per_bitplane;
+        desc->dw0.length = bytes_per_bitplane;
+        desc->buffer = slot_base + bit * bytes_per_bitplane;
+        desc->next = &descriptors_[(desc_idx + 1) % descriptor_count_];
+        desc_idx++;
+      }
+    }
+    descriptors_[desc_idx - 1].dw0.suc_eof = 1;
+  }
+
+  ESP_LOGI(TAG, "Bounce descriptor chain: %zu descriptors (%zu per row × %u slots, %zu bytes)", descriptor_count_,
+           descs_per_row_, bounce_slots_, descriptor_count_ * sizeof(dma_descriptor_t));
+  return true;
 }
 
 // ============================================================================
@@ -1160,8 +1280,6 @@ void GdmaDma::initialize_blank_buffers() {
   for (int i = 0; i < 2; i++) {
     if (row_buffers_[i]) {
       initialize_buffer_internal(row_buffers_[i]);
-      mark_all_rows_dirty(i);
-      sync_dirty_rows(i);
     }
   }
   ESP_LOGI(TAG, "Blank buffers initialized");
@@ -1317,13 +1435,10 @@ void GdmaDma::set_brightness_oe() {
 
   ESP_LOGD(TAG, "Setting brightness OE: brightness=%u, lsbMsbTransitionBit=%u", brightness, lsbMsbTransitionBit_);
 
-  // Update OE bits in all allocated buffers. Both are rewritten, so both are written back:
-  // the back buffer becomes the front one on the next flip.
+  // Update OE bits in all allocated buffers
   for (int i = 0; i < 2; i++) {
     if (row_buffers_[i]) {
       set_brightness_oe_internal(row_buffers_[i], brightness);
-      mark_all_rows_dirty(i);
-      sync_dirty_rows(i);
     }
   }
 
@@ -1496,54 +1611,6 @@ void GdmaDma::calculate_bcm_timings() {
   }
 
   ESP_LOGI(TAG, "BCM timing calculated (lsbMsbTransitionBit used by set_brightness_oe for OE control)");
-}
-
-void GdmaDma::mark_y_span_dirty(int buffer_idx, uint16_t y, uint16_t h) {
-  if (h == 0) {
-    return;
-  }
-  // Identity transform: display row py lives in DMA row py (upper half) or py - num_rows_
-  // (lower half). A span crossing the halves touches rows from 0 up to num_rows_.
-  const uint16_t last_y = y + h - 1;
-  if (last_y < num_rows_) {
-    mark_rows_dirty(buffer_idx, y, last_y + 1);
-  } else if (y >= num_rows_) {
-    mark_rows_dirty(buffer_idx, y - num_rows_, last_y - num_rows_ + 1);
-  } else {
-    mark_all_rows_dirty(buffer_idx);
-  }
-}
-
-void GdmaDma::sync_dirty_rows(int buffer_idx) {
-#if HUB75_EXTERNAL_FRAMEBUFFERS
-  const uint16_t begin = dirty_row_begin_[buffer_idx];
-  const uint16_t end = dirty_row_end_[buffer_idx];
-  dirty_row_begin_[buffer_idx] = UINT16_MAX;
-  dirty_row_end_[buffer_idx] = 0;
-  if (!buffer_in_psram_[buffer_idx] || begin >= end) {
-    return;
-  }
-
-  // Widen the row range to whole cache lines. The allocation is aligned and padded to
-  // PSRAM_FB_ALIGNMENT, so the widened range never leaves this buffer.
-  const size_t start = (begin * row_stride_bytes_) & ~(PSRAM_FB_ALIGNMENT - 1);
-  const size_t stop =
-      std::min(total_buffer_bytes_, (end * row_stride_bytes_ + PSRAM_FB_ALIGNMENT - 1) & ~(PSRAM_FB_ALIGNMENT - 1));
-  uint8_t *const addr = dma_buffers_[buffer_idx] + start;
-  const size_t size = stop - start;
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
-  const esp_err_t err = esp_cache_msync(addr, size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
-  // C2M is the only (implicit) direction before IDF 5.2
-  const esp_err_t err = esp_cache_msync(addr, size, 0);
-#else
-  const esp_err_t err = Cache_WriteBack_Addr((uint32_t) addr, size) == 0 ? ESP_OK : ESP_FAIL;
-#endif
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "PSRAM cache write-back failed: %s", esp_err_to_name(err));
-  }
-#endif
 }
 
 // ============================================================================

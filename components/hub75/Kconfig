@@ -742,26 +742,40 @@ menu "HUB75 RGB LED Matrix Driver"
                 Disable only if IRAM space is critically constrained.
 
         config HUB75_EXTERNAL_FRAMEBUFFERS
-            bool "Allocate DMA framebuffers in PSRAM"
+            bool "Allocate framebuffers in PSRAM"
             depends on SPIRAM && (IDF_TARGET_ESP32S3 || IDF_TARGET_ESP32P4)
             default y if IDF_TARGET_ESP32P4
             default n
             help
-                Allocates the DMA framebuffers in external memory (PSRAM)
-                instead of internal RAM. DMA descriptors stay in internal RAM.
-                Only ESP32-S3 (GDMA) and ESP32-P4 (PARLIO) can stream from
-                PSRAM; the ESP32 and ESP32-S2 I2S DMA cannot.
+                Allocates the framebuffers in external memory (PSRAM) instead
+                of internal RAM. Only ESP32-S3 (GDMA) and ESP32-P4 (PARLIO)
+                support this; the ESP32 and ESP32-S2 I2S DMA do not.
 
-                On ESP32-S3 this frees the framebuffer from internal RAM
-                (64 KB per buffer for a 128x64 panel at 8 bit depth). If a
-                PSRAM allocation fails the driver falls back to internal RAM.
+                On ESP32-S3 the GDMA keeps reading internal RAM only: a small
+                ring of HUB75_BOUNCE_ROWS row slots, refilled by an IRAM
+                interrupt that copies each row from PSRAM just before it is
+                shown (the bounce buffer scheme of the IDF RGB LCD driver).
+                This frees the framebuffers from internal RAM (64 KB per
+                buffer for a 128x64 panel at 8 bit depth) at the cost of one
+                row copy per row time in interrupt context. If a PSRAM
+                allocation fails the driver falls back to internal RAM.
 
-                The display then streams continuously from PSRAM
-                (output clock x 2 bytes per second, 64 MB/s at 32 MHz), sharing
-                the SPI bus with the CPU cache, other DMA users and flash
-                writes. Use octal PSRAM at 80 MHz or faster and lower the
-                output clock if the panel flickers or shows corruption under
-                load, especially during flash writes (OTA, NVS, filesystem).
+                Enable SPIRAM_XIP_FROM_PSRAM as well, otherwise the refill
+                interrupt cannot run while flash is written (OTA, NVS,
+                filesystems) and rows repeat on the panel meanwhile. With it
+                enabled, a frame callback must be in IRAM.
+
+        config HUB75_BOUNCE_ROWS
+            int "Bounce ring rows"
+            depends on HUB75_EXTERNAL_FRAMEBUFFERS && IDF_TARGET_ESP32S3
+            range 2 16
+            default 4
+            help
+                Number of internal RAM row slots the GDMA plays from. Each slot
+                holds one scan row with all bit planes (2 KB for a 128 pixel
+                wide chain at 8 bit depth). The refill interrupt for a slot
+                may be delayed by up to (rows - 1) row times before the panel
+                shows stale data.
 
     endmenu
 
